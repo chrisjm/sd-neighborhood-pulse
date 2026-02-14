@@ -92,7 +92,7 @@ def load_schema_contracts(
         raise FileNotFoundError(f"dictionary file not found: {dictionary_path}")
 
     fields: list[str] = []
-    with dictionary_path.open("r", encoding="utf-8", newline="") as handle:
+    with dictionary_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         if "field" not in (reader.fieldnames or []):
             raise ValueError("dictionary missing 'field' column")

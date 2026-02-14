@@ -27,14 +27,17 @@
    - Grains: `comm_plan_name` (primary), `council_district`, `zipcode`
    - Equal-weight components (v1): backlog, aging (>14 days), repeat pressure, resolution lag
 
- ## Manual Daily Refresh (v1)
+## Manual Daily Refresh (v1)
 Run from project root:
 
- ```bash
- uv run python scripts/ingest.py --source all
- uv run dbt run --project-dir city_health --profiles-dir .
- uv run dbt test --project-dir city_health --profiles-dir .
- uv run dbt snapshot --project-dir city_health --profiles-dir .
+```bash
+./scripts/run_daily_pipeline.sh
+```
+
+To force re-downloads for all sources:
+
+```bash
+./scripts/run_daily_pipeline.sh --force
 ```
 
 ## Scheduled Daily Refresh (cron/systemd)
@@ -44,7 +47,7 @@ For now, orchestration is intentionally lightweight and dbt-friendly.
 Run every day at 5:10 AM:
 
 ```bash
-10 5 * * * cd /home/chris/code/sd-neighborhood-pulse && uv run python scripts/ingest.py --source all && uv run dbt run --project-dir city_health --profiles-dir . && uv run dbt test --project-dir city_health --profiles-dir . && uv run dbt snapshot --project-dir city_health --profiles-dir .
+10 5 * * * cd /home/chris/code/sd-neighborhood-pulse && ./scripts/run_daily_pipeline.sh
 ```
 
 Notes:

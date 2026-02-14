@@ -16,7 +16,12 @@ GRAIN_LABELS = {
 BOUNDARY_DIR = Path("data/boundaries")
 ALT_BOUNDARY_DIR = Path("data/geojson")
 BOUNDARY_FILE_CANDIDATES = {
-    "comm_plan_name": ["comm_plan_name.geojson", "community_plans.geojson", "community_plan.geojson"],
+    "comm_plan_name": [
+        "comm_plan_codes.geojson",
+        "comm_plan_name.geojson",
+        "community_plans.geojson",
+        "community_plan.geojson",
+    ],
     "council_district": ["council_district.geojson", "council_districts.geojson"],
     "zipcode": ["zipcode.geojson", "zipcodes.geojson", "zcta.geojson"],
 }
@@ -92,12 +97,24 @@ def normalize_join_value(value: object, grain_type: str) -> str:
     if text == "":
         return ""
 
+    if grain_type == "comm_plan_name":
+        text = text.lower().replace("&", " and ")
+        text = re.sub(r"[^a-z0-9 ]+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text.startswith("reserve area"):
+            return "reserve"
+        return text
+
     if grain_type == "council_district":
         match = re.search(r"(\d{1,2})", text)
         if match:
             return str(int(match.group(1)))
 
     return text
+
+
+def is_reserve_comm_plan(value: object) -> bool:
+    return normalize_join_value(value, "comm_plan_name") == "reserve"
 
 
 def detect_join_key(geojson: dict, candidate_values: set[str], grain_type: str) -> str | None:
@@ -217,6 +234,13 @@ st.sidebar.header("Filters")
 window = st.sidebar.selectbox("Window (days)", [30, 90], index=0)
 grain = st.sidebar.selectbox("Neighborhood grain", ["comm_plan_name", "council_district", "zipcode"], index=0)
 st.sidebar.caption("Showing all areas for the selected grain and window.")
+include_reserve = False
+if grain == "comm_plan_name":
+    include_reserve = st.sidebar.checkbox("Include Reserve (power users)", value=False)
+    if include_reserve:
+        st.sidebar.caption("Including Reserve area in community plan views.")
+    else:
+        st.sidebar.caption("Reserve is excluded by default. Enable the checkbox to include it.")
 
 current_slice_all = frustration[
     (frustration["window_days"] == window)
@@ -224,11 +248,13 @@ current_slice_all = frustration[
     & (frustration["as_of_date"] == latest_date)
 ].sort_values("frustration_index", ascending=False)
 current_slice = current_slice_all[current_slice_all["grain_value"] != "Unknown"]
+if grain == "comm_plan_name" and not include_reserve:
+    current_slice = current_slice[~current_slice["grain_value"].apply(is_reserve_comm_plan)]
 
 if current_slice_all.empty:
     st.warning(
         f"No rows available for {grain} at {window}-day window on {latest_date_display}. "
-        "Try a different preset or switch to Custom mode."
+        "Try a different window or neighborhood grain."
     )
     st.stop()
 
@@ -239,7 +265,10 @@ if current_unknown_rate > 0:
     )
 
 if current_slice.empty:
-    st.info("All rows are currently Unknown after cleaning for this cut; switch grain/window to continue exploration.")
+    if grain == "comm_plan_name" and not include_reserve:
+        st.info("No non-Reserve community plan rows available for this cut. Enable 'Include Reserve' to include it.")
+    else:
+        st.info("All rows are currently Unknown after cleaning for this cut; switch grain/window to continue exploration.")
     st.stop()
 
 non_zero_grain_count = int((current_slice["request_count"] > 0).sum())
@@ -275,6 +304,8 @@ city_slice = frustration[
     & (frustration["grain_type"] == grain)
     & (frustration["grain_value"] != "Unknown")
 ]
+if grain == "comm_plan_name" and not include_reserve:
+    city_slice = city_slice[~city_slice["grain_value"].apply(is_reserve_comm_plan)]
 city_median_latest = float(current_slice["frustration_index"].median())
 latest_index = float(selected_latest["frustration_index"])
 latest_requests = float(selected_latest["request_count"])
@@ -327,6 +358,9 @@ st.caption(
 )
 
 st.subheader(f"Current Frustration Index ({GRAIN_LABELS[grain]}, {window}-day)")
+if grain == "comm_plan_name":
+    reserve_note = "included" if include_reserve else "excluded"
+    st.caption(f"Reserve area is {reserve_note} in this community plan view.")
 top_ranked = (
     current_slice.sort_values("frustration_index", ascending=False)
     .head(top_n)

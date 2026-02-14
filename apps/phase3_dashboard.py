@@ -88,6 +88,13 @@ current_slice = frustration[
     & (frustration["as_of_date"] == latest_date)
 ].sort_values("frustration_index", ascending=False)
 
+if current_slice.empty:
+    st.warning(
+        f"No rows available for {grain} at {window}-day window on {latest_date}. "
+        "Try a different preset or switch to Custom mode."
+    )
+    st.stop()
+
 st.subheader(f"Current Frustration Index ({grain}, {window}-day)")
 col1, col2 = st.columns([2, 1])
 
@@ -106,7 +113,7 @@ with col1:
         title=f"Top {top_n} areas by frustration index",
     )
     fig_bar.update_layout(yaxis={"categoryorder": "total ascending"}, height=600)
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_bar, width="stretch")
 
 with col2:
     st.metric("As of date", str(latest_date))
@@ -127,13 +134,17 @@ trend = frustration[
     & (frustration["grain_value"] == selected_value)
 ].sort_values("as_of_date")
 
+if trend.empty:
+    st.info("No trend points available for the selected area.")
+    st.stop()
+
 fig_trend = px.line(
     trend,
     x="as_of_date",
     y=["frustration_index", "backlog_component", "aging_component", "repeat_component", "resolution_component"],
     title=f"Index and components trend: {selected_value}",
 )
-st.plotly_chart(fig_trend, use_container_width=True)
+st.plotly_chart(fig_trend, width="stretch")
 
 st.subheader("Hotspots")
 hotspot_slice = hotspots[hotspots["window_days"] == window].head(200)
@@ -150,7 +161,7 @@ st.dataframe(
             "centroid_longitude",
         ]
     ],
-    use_container_width=True,
+    width="stretch",
 )
 
 st.info(

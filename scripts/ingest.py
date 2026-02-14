@@ -13,6 +13,14 @@ SOURCE_REGISTRY = {
     "open_current": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_open_datasd.csv",
     "closed_2026": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2026_datasd.csv",
     "closed_2025": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2025_datasd.csv",
+    "closed_2024": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2024_datasd.csv",
+    "closed_2023": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2023_datasd.csv",
+    "closed_2022": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2022_datasd.csv",
+    "closed_2021": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2021_datasd.csv",
+    "closed_2020": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2020_datasd.csv",
+    "closed_2019": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2019_datasd.csv",
+    "closed_2018": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2018_datasd.csv",
+    "closed_2017": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2017_datasd.csv"
 }
 
 DICTIONARY_PATH = Path("data/dictionaries/get_it_done_dictionary.csv")

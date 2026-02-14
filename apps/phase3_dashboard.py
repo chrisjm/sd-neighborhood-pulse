@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import re
 
 import duckdb
 import pandas as pd
@@ -86,25 +87,79 @@ def load_boundary_geojson(grain_type: str) -> tuple[dict | None, str | None]:
     return None, None
 
 
-def detect_join_key(geojson: dict, candidate_values: set[str]) -> str | None:
+def normalize_join_value(value: object, grain_type: str) -> str:
+    text = str(value).strip()
+    if text == "":
+        return ""
+
+    if grain_type == "council_district":
+        match = re.search(r"(\d{1,2})", text)
+        if match:
+            return str(int(match.group(1)))
+
+    return text
+
+
+def detect_join_key(geojson: dict, candidate_values: set[str], grain_type: str) -> str | None:
     features = geojson.get("features", [])
     if not features:
         return None
 
+    normalized_candidates = {normalize_join_value(value, grain_type) for value in candidate_values}
+    normalized_candidates.discard("")
+
     sample_props = features[0].get("properties", {})
     best_key = None
     best_overlap = 0
+    best_score = 0.0
     for key in sample_props:
         geo_values = {
-            str(feature.get("properties", {}).get(key, "")).strip()
+            normalize_join_value(feature.get("properties", {}).get(key, ""), grain_type)
             for feature in features
             if feature.get("properties", {}).get(key) is not None
         }
-        overlap = len(candidate_values & geo_values)
-        if overlap > best_overlap:
+        overlap = len(normalized_candidates & geo_values)
+        if overlap == 0:
+            continue
+
+        denominator = max(len(normalized_candidates), len(geo_values), 1)
+        score = overlap / denominator
+        if score > best_score or (score == best_score and overlap > best_overlap):
+            best_score = score
             best_overlap = overlap
             best_key = key
     return best_key if best_overlap > 0 else None
+
+
+def geojson_property_is_numeric(geojson: dict, key: str) -> bool:
+    for feature in geojson.get("features", []):
+        value = feature.get("properties", {}).get(key)
+        if value is not None:
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return False
+
+
+def filter_geojson_for_grain(geojson: dict, grain_type: str) -> dict:
+    if grain_type != "council_district":
+        return geojson
+
+    features = geojson.get("features", [])
+    if not features:
+        return geojson
+
+    sample_props = features[0].get("properties", {})
+    if "JUR_NAME" not in sample_props:
+        return geojson
+
+    filtered_features = [
+        feature
+        for feature in features
+        if str(feature.get("properties", {}).get("JUR_NAME", "")).strip().upper() == "SAN DIEGO"
+    ]
+    if not filtered_features:
+        return geojson
+
+    return {**geojson, "features": filtered_features}
 
 
 def normalize_zipcode_value(value: object) -> str:
@@ -143,14 +198,6 @@ st.set_page_config(page_title="SD Neighborhood Pulse", layout="wide")
 st.title("San Diego Neighborhood Pulse")
 st.caption("Neighborhood service frustration and hotspot monitoring")
 
-PRESETS = {
-    "Top 10 Comm Plans (30d)": {"window": 30, "grain": "comm_plan_name", "top_n": 10},
-    "Top 10 Council Districts (30d)": {"window": 30, "grain": "council_district", "top_n": 10},
-    "Top 10 ZIP Codes (30d)": {"window": 30, "grain": "zipcode", "top_n": 10},
-    "Top 20 Comm Plans (90d)": {"window": 90, "grain": "comm_plan_name", "top_n": 20},
-    "Custom": None,
-}
-
 if not DB_PATH.exists():
     st.error("DuckDB file not found. Run the manual refresh workflow first.")
     st.stop()
@@ -165,22 +212,11 @@ if frustration.empty:
     st.stop()
 
 latest_date = frustration["as_of_date"].max()
+latest_date_display = pd.to_datetime(latest_date).date().isoformat()
 st.sidebar.header("Filters")
-preset_name = st.sidebar.selectbox("Quick view", list(PRESETS.keys()), index=0)
-
-if PRESETS[preset_name] is not None:
-    preset = PRESETS[preset_name]
-    window = preset["window"]
-    grain = preset["grain"]
-    top_n = preset["top_n"]
-    st.sidebar.caption(f"Preset applied: {preset_name}")
-else:
-    window = st.sidebar.selectbox("Window (days)", [30, 90], index=0)
-    grain = st.sidebar.selectbox("Neighborhood grain", ["comm_plan_name", "council_district", "zipcode"], index=0)
-    top_n = st.sidebar.slider("Top N neighborhoods", min_value=10, max_value=50, value=20, step=5)
-
-if PRESETS[preset_name] is not None:
-    st.sidebar.write("Adjust manually by switching to **Custom**.")
+window = st.sidebar.selectbox("Window (days)", [30, 90], index=0)
+grain = st.sidebar.selectbox("Neighborhood grain", ["comm_plan_name", "council_district", "zipcode"], index=0)
+st.sidebar.caption("Showing all areas for the selected grain and window.")
 
 current_slice_all = frustration[
     (frustration["window_days"] == window)
@@ -191,7 +227,7 @@ current_slice = current_slice_all[current_slice_all["grain_value"] != "Unknown"]
 
 if current_slice_all.empty:
     st.warning(
-        f"No rows available for {grain} at {window}-day window on {latest_date}. "
+        f"No rows available for {grain} at {window}-day window on {latest_date_display}. "
         "Try a different preset or switch to Custom mode."
     )
     st.stop()
@@ -206,7 +242,17 @@ if current_slice.empty:
     st.info("All rows are currently Unknown after cleaning for this cut; switch grain/window to continue exploration.")
     st.stop()
 
-selected_options = current_slice["grain_value"].tolist()[:100]
+non_zero_grain_count = int((current_slice["request_count"] > 0).sum())
+default_top_n = non_zero_grain_count if non_zero_grain_count > 0 else int(len(current_slice))
+top_n = st.sidebar.slider(
+    "Top N neighborhoods",
+    min_value=1,
+    max_value=int(len(current_slice)),
+    value=default_top_n,
+    step=1,
+)
+
+selected_options = current_slice["grain_value"].tolist()
 selected_value = st.sidebar.selectbox(
     f"Focus {GRAIN_LABELS[grain]}",
     options=selected_options,
@@ -276,16 +322,16 @@ st.caption(
 )
 
 st.caption(
-    f"As of {latest_date} | Areas in cut: {len(current_slice)} | "
+    f"As of {latest_date_display} | Areas in cut: {len(current_slice)} | "
     f"Highest area now: {str(current_slice.iloc[0]['grain_value'])}"
 )
 
 st.subheader(f"Current Frustration Index ({GRAIN_LABELS[grain]}, {window}-day)")
-if PRESETS[preset_name] is None:
-    st.caption("Custom mode enabled")
-else:
-    st.caption(f"Preset mode: {preset_name}")
-top_ranked = current_slice.head(top_n).sort_values("frustration_index", ascending=True)
+top_ranked = (
+    current_slice.sort_values("frustration_index", ascending=False)
+    .head(top_n)
+    .sort_values("frustration_index", ascending=True)
+)
 top_ranked = top_ranked.copy()
 top_ranked["grain_value_display"] = top_ranked["grain_value"].astype(str)
 
@@ -302,7 +348,8 @@ fig_bar = px.bar(
         "grain_value_display": GRAIN_LABELS[grain],
     },
 )
-fig_bar.update_layout(height=560, coloraxis_showscale=False)
+chart_height = min(1400, max(560, int(len(top_ranked) * 28)))
+fig_bar.update_layout(height=chart_height, coloraxis_showscale=False)
 fig_bar.update_yaxes(type="category")
 st.plotly_chart(fig_bar, width="stretch")
 
@@ -364,14 +411,26 @@ hotspot_slice = hotspot_slice[hotspot_slice["grain_value"] != "Unknown"]
 geojson, geojson_path = load_boundary_geojson(grain)
 boundary_join_key = None
 if geojson is not None:
-    boundary_join_key = detect_join_key(geojson, set(current_slice["grain_value"].astype(str)))
+    geojson = filter_geojson_for_grain(geojson, grain)
+    boundary_join_key = detect_join_key(geojson, set(current_slice["grain_value"].astype(str)), grain)
 
 if geojson is not None and boundary_join_key is not None:
     choropleth_data = current_slice[["grain_value", "frustration_index"]].copy()
+    location_column = "grain_value"
+
+    if grain == "council_district":
+        district_digits = choropleth_data["grain_value"].astype(str).str.extract(r"(\d{1,2})")[0]
+        if geojson_property_is_numeric(geojson, boundary_join_key):
+            choropleth_data["join_location"] = pd.to_numeric(district_digits, errors="coerce")
+        else:
+            choropleth_data["join_location"] = district_digits
+        choropleth_data = choropleth_data[choropleth_data["join_location"].notna()].copy()
+        location_column = "join_location"
+
     fig_choropleth = px.choropleth_map(
         choropleth_data,
         geojson=geojson,
-        locations="grain_value",
+        locations=location_column,
         featureidkey=f"properties.{boundary_join_key}",
         color="frustration_index",
         color_continuous_scale="Reds",

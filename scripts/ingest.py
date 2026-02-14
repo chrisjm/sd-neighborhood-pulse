@@ -23,6 +23,8 @@ SOURCE_REGISTRY = {
     "closed_2017": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2017_datasd.csv"
 }
 
+DAILY_REFRESH_SOURCES = {"open_current", "closed_2026"}
+
 DICTIONARY_PATH = Path("data/dictionaries/get_it_done_dictionary.csv")
 DATASET_SPECIFIC_OPTIONAL_COLUMNS = {"specify_the_issue"}
 
@@ -52,6 +54,14 @@ DEFAULT_REQUIRED_COLUMNS = [
     "public_description",
 ]
 DEFAULT_OPTIONAL_COLUMNS = ["specify_the_issue"]
+
+
+def is_daily_refresh_source(source_key: str) -> bool:
+    return source_key in DAILY_REFRESH_SOURCES
+
+
+def is_backfill_once_source(source_key: str) -> bool:
+    return not is_daily_refresh_source(source_key)
 
 
 def configure_logging() -> logging.Logger:
@@ -153,15 +163,17 @@ def process_source(
     logger.info("source=%s step=start url=%s", source_key, url)
 
     try:
-        if dry_run and not archive_path.exists():
+        if not force and is_backfill_once_source(source_key) and latest_path.exists():
+            validation = validate_columns(latest_path, required_columns, optional_columns)
             logger.info(
-                "source=%s step=dry_run_skip reason=no_archive_present path=%s",
+                "source=%s step=skip_download reason=backfill_latest_exists sample_rows=%s missing_optional=%s",
                 source_key,
-                archive_path,
+                validation["row_count_sample"],
+                validation["missing_optional"],
             )
             return True
 
-        if archive_path.exists() and not force:
+        if not force and is_daily_refresh_source(source_key) and archive_path.exists():
             validation = validate_columns(archive_path, required_columns, optional_columns)
             logger.info(
                 "source=%s step=skip_download reason=archive_exists sample_rows=%s missing_optional=%s",
@@ -169,20 +181,29 @@ def process_source(
                 validation["row_count_sample"],
                 validation["missing_optional"],
             )
-        else:
-            if dry_run:
-                logger.info("source=%s step=dry_run_download path=%s", source_key, archive_path)
-            else:
-                download_csv(url, archive_path)
-                logger.info("source=%s step=download_complete path=%s", source_key, archive_path)
+            promote_latest(archive_path, latest_path, dry_run=dry_run)
+            logger.info("source=%s step=latest_updated path=%s dry_run=%s", source_key, latest_path, dry_run)
+            return True
 
-            validation = validate_columns(archive_path, required_columns, optional_columns)
+        if dry_run:
             logger.info(
-                "source=%s step=validated sample_rows=%s missing_optional=%s",
+                "source=%s step=dry_run_download archive_path=%s latest_path=%s",
                 source_key,
-                validation["row_count_sample"],
-                validation["missing_optional"],
+                archive_path,
+                latest_path,
             )
+            return True
+
+        download_csv(url, archive_path)
+        logger.info("source=%s step=download_complete path=%s", source_key, archive_path)
+
+        validation = validate_columns(archive_path, required_columns, optional_columns)
+        logger.info(
+            "source=%s step=validated sample_rows=%s missing_optional=%s",
+            source_key,
+            validation["row_count_sample"],
+            validation["missing_optional"],
+        )
 
         promote_latest(archive_path, latest_path, dry_run=dry_run)
         logger.info("source=%s step=latest_updated path=%s dry_run=%s", source_key, latest_path, dry_run)

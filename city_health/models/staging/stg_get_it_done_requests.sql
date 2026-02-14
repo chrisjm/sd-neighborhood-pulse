@@ -4,6 +4,22 @@ with unioned as (
     select * from {{ ref('src_get_it_done_closed_2026_latest') }}
     union all
     select * from {{ ref('src_get_it_done_closed_2025_latest') }}
+    union all
+    select * from {{ ref('src_get_it_done_closed_2024_latest') }}
+    union all
+    select * from {{ ref('src_get_it_done_closed_2023_latest') }}
+    union all
+    select * from {{ ref('src_get_it_done_closed_2022_latest') }}
+    union all
+    select * from {{ ref('src_get_it_done_closed_2021_latest') }}
+    union all
+    select * from {{ ref('src_get_it_done_closed_2020_latest') }}
+    union all
+    select * from {{ ref('src_get_it_done_closed_2019_latest') }}
+    union all
+    select * from {{ ref('src_get_it_done_closed_2018_latest') }}
+    union all
+    select * from {{ ref('src_get_it_done_closed_2017_latest') }}
 )
 
 select

@@ -1,4 +1,5 @@
 from pathlib import Path
+import logging
 import sys
 
 import pytest
@@ -10,7 +11,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from scripts.ingest import (
     DEFAULT_OPTIONAL_COLUMNS,
     DEFAULT_REQUIRED_COLUMNS,
+    is_backfill_once_source,
+    is_daily_refresh_source,
     load_schema_contracts,
+    process_source,
     promote_latest,
     validate_columns,
 )
@@ -82,3 +86,94 @@ def test_promote_latest_dry_run_does_not_copy(tmp_path: Path) -> None:
     promote_latest(archive_path, latest_path, dry_run=True)
 
     assert not latest_path.exists()
+
+
+def test_source_classification_matches_refresh_policy() -> None:
+    assert is_daily_refresh_source("open_current")
+    assert is_daily_refresh_source("closed_2026")
+    assert not is_daily_refresh_source("closed_2025")
+    assert is_backfill_once_source("closed_2025")
+
+
+def test_process_source_skips_backfill_when_latest_exists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    archive_path = tmp_path / "archive.csv"
+    latest_path = tmp_path / "latest.csv"
+    latest_path.write_text("a,b\n1,2\n", encoding="utf-8")
+
+    def fake_build_paths(source_key: str, run_date: str) -> tuple[Path, Path]:
+        return archive_path, latest_path
+
+    monkeypatch.setattr("scripts.ingest.build_paths", fake_build_paths)
+    monkeypatch.setattr(
+        "scripts.ingest.validate_columns",
+        lambda path, required, optional: {"row_count_sample": 1, "missing_optional": []},
+    )
+
+    calls = {"download": 0, "promote": 0}
+
+    def fake_download(url: str, destination: Path) -> None:
+        calls["download"] += 1
+
+    def fake_promote(source: Path, destination: Path, dry_run: bool = False) -> None:
+        calls["promote"] += 1
+
+    monkeypatch.setattr("scripts.ingest.download_csv", fake_download)
+    monkeypatch.setattr("scripts.ingest.promote_latest", fake_promote)
+
+    logger = logging.getLogger("test-ingest-backfill")
+    result = process_source(
+        source_key="closed_2025",
+        url="https://example.test/closed_2025.csv",
+        run_date="2026-02-14",
+        force=False,
+        dry_run=False,
+        required_columns=DEFAULT_REQUIRED_COLUMNS,
+        optional_columns=DEFAULT_OPTIONAL_COLUMNS,
+        logger=logger,
+    )
+
+    assert result is True
+    assert calls["download"] == 0
+    assert calls["promote"] == 0
+
+
+def test_process_source_daily_refresh_skips_when_archive_exists(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    archive_path = tmp_path / "archive.csv"
+    latest_path = tmp_path / "latest.csv"
+    archive_path.write_text("a,b\n1,2\n", encoding="utf-8")
+
+    def fake_build_paths(source_key: str, run_date: str) -> tuple[Path, Path]:
+        return archive_path, latest_path
+
+    monkeypatch.setattr("scripts.ingest.build_paths", fake_build_paths)
+    monkeypatch.setattr(
+        "scripts.ingest.validate_columns",
+        lambda path, required, optional: {"row_count_sample": 1, "missing_optional": []},
+    )
+
+    calls = {"download": 0, "promote": 0}
+
+    def fake_download(url: str, destination: Path) -> None:
+        calls["download"] += 1
+
+    def fake_promote(source: Path, destination: Path, dry_run: bool = False) -> None:
+        calls["promote"] += 1
+
+    monkeypatch.setattr("scripts.ingest.download_csv", fake_download)
+    monkeypatch.setattr("scripts.ingest.promote_latest", fake_promote)
+
+    logger = logging.getLogger("test-ingest-daily")
+    result = process_source(
+        source_key="open_current",
+        url="https://example.test/open_current.csv",
+        run_date="2026-02-14",
+        force=False,
+        dry_run=False,
+        required_columns=DEFAULT_REQUIRED_COLUMNS,
+        optional_columns=DEFAULT_OPTIONAL_COLUMNS,
+        logger=logger,
+    )
+
+    assert result is True
+    assert calls["download"] == 0
+    assert calls["promote"] == 1

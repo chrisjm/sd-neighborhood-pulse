@@ -3,7 +3,7 @@ with raw as (
     from read_csv_auto('data/raw/latest/get_it_done_closed_2022_latest.csv', header = true, all_varchar = true)
 )
 
-select
+select distinct
     service_request_id,
     service_request_parent_id,
     sap_notification_number,

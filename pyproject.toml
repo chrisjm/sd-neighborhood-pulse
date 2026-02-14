@@ -8,5 +8,6 @@ dependencies = [
     "dbt-duckdb>=1.10.0",
     "duckdb>=1.4.4",
     "pandas>=2.3.3",
+    "pytest>=8.4.2",
     "requests>=2.32.5",
 ]

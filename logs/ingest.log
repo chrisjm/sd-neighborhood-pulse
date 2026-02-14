@@ -1,0 +1,13 @@
+2026-02-13 19:04:12,182 INFO source=open_current step=start url=https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_open_datasd.csv
+2026-02-13 19:04:13,848 INFO source=open_current step=download_complete path=data/raw/archive/open_current/get_it_done_open_current_2026-02-13.csv
+2026-02-13 19:04:13,855 INFO source=open_current step=validated sample_rows=100 missing_optional=['specify_the_issue']
+2026-02-13 19:04:13,884 INFO source=open_current step=latest_updated path=data/raw/latest/get_it_done_open_current_latest.csv dry_run=False
+2026-02-13 19:04:13,884 INFO source=closed_2026 step=start url=https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2026_datasd.csv
+2026-02-13 19:04:14,947 INFO source=closed_2026 step=download_complete path=data/raw/archive/closed_2026/get_it_done_closed_2026_2026-02-13.csv
+2026-02-13 19:04:14,952 INFO source=closed_2026 step=validated sample_rows=100 missing_optional=['specify_the_issue']
+2026-02-13 19:04:14,969 INFO source=closed_2026 step=latest_updated path=data/raw/latest/get_it_done_closed_2026_latest.csv dry_run=False
+2026-02-13 19:04:14,969 INFO source=closed_2025 step=start url=https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2025_datasd.csv
+2026-02-13 19:04:20,210 INFO source=closed_2025 step=download_complete path=data/raw/archive/closed_2025/get_it_done_closed_2025_2026-02-13.csv
+2026-02-13 19:04:20,214 INFO source=closed_2025 step=validated sample_rows=100 missing_optional=['specify_the_issue']
+2026-02-13 19:04:20,325 INFO source=closed_2025 step=latest_updated path=data/raw/latest/get_it_done_closed_2025_latest.csv dry_run=False
+2026-02-13 19:04:20,325 INFO run_status=success source_count=3

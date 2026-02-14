@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: stg_get_it_done_requests
+    description: Unified and typed staging model across open and selected closed Get It Done datasets.
+    columns:
+      - name: service_request_id
+        tests:
+          - not_null
+      - name: date_requested
+        tests:
+          - not_null
+      - name: source_dataset
+        tests:
+          - not_null
+      - name: status_bucket
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['open', 'closed', 'referred', 'other']

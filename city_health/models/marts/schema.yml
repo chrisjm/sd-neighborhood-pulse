@@ -1,0 +1,65 @@
+version: 2
+
+models:
+  - name: fct_request_hotspots
+    description: SQL-native spatial hotspot clusters at 30d and 90d windows.
+    columns:
+      - name: cluster_id
+        tests:
+          - not_null
+      - name: window_days
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [30, 90]
+      - name: comm_plan_name
+        tests:
+          - not_null
+      - name: request_count
+        tests:
+          - not_null
+
+  - name: fct_neighborhood_daily_metrics
+    description: Daily request pressure metrics by neighborhood grain (comm plan, district, ZIP).
+    columns:
+      - name: metric_date
+        tests:
+          - not_null
+      - name: grain_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['comm_plan_name', 'council_district', 'zipcode']
+      - name: grain_value
+        tests:
+          - not_null
+      - name: request_count
+        tests:
+          - not_null
+
+  - name: fct_neighborhood_frustration_index
+    description: Rolling 30d/90d frustration index and components by neighborhood grain.
+    columns:
+      - name: as_of_date
+        tests:
+          - not_null
+      - name: grain_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['comm_plan_name', 'council_district', 'zipcode']
+      - name: grain_value
+        tests:
+          - not_null
+      - name: window_days
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [30, 90]
+      - name: frustration_index
+        tests:
+          - not_null

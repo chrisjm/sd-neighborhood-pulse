@@ -117,6 +117,18 @@ def is_reserve_comm_plan(value: object) -> bool:
     return normalize_join_value(value, "comm_plan_name") == "reserve"
 
 
+def build_geojson_join_lookup(geojson: dict, join_key: str, grain_type: str) -> dict[str, object]:
+    lookup: dict[str, object] = {}
+    for feature in geojson.get("features", []):
+        raw_value = feature.get("properties", {}).get(join_key)
+        if raw_value is None:
+            continue
+        normalized_value = normalize_join_value(raw_value, grain_type)
+        if normalized_value and normalized_value not in lookup:
+            lookup[normalized_value] = raw_value
+    return lookup
+
+
 def detect_join_key(geojson: dict, candidate_values: set[str], grain_type: str) -> str | None:
     features = geojson.get("features", [])
     if not features:
@@ -451,6 +463,14 @@ if geojson is not None:
 if geojson is not None and boundary_join_key is not None:
     choropleth_data = current_slice[["grain_value", "frustration_index"]].copy()
     location_column = "grain_value"
+
+    if grain == "comm_plan_name":
+        comm_plan_lookup = build_geojson_join_lookup(geojson, boundary_join_key, grain)
+        choropleth_data["join_location"] = choropleth_data["grain_value"].apply(
+            lambda value: comm_plan_lookup.get(normalize_join_value(value, grain))
+        )
+        choropleth_data = choropleth_data[choropleth_data["join_location"].notna()].copy()
+        location_column = "join_location"
 
     if grain == "council_district":
         district_digits = choropleth_data["grain_value"].astype(str).str.extract(r"(\d{1,2})")[0]

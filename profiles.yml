@@ -1,0 +1,9 @@
+city_health:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: 'data/db/city_health.duckdb'
+      extensions: 
+        - spatial
+        - httpfs

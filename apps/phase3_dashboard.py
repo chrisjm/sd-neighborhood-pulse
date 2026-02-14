@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 import duckdb
 import pandas as pd
@@ -10,6 +11,13 @@ GRAIN_LABELS = {
     "comm_plan_name": "Community Plan",
     "council_district": "Council District",
     "zipcode": "ZIP Code",
+}
+BOUNDARY_DIR = Path("data/boundaries")
+ALT_BOUNDARY_DIR = Path("data/geojson")
+BOUNDARY_FILE_CANDIDATES = {
+    "comm_plan_name": ["comm_plan_name.geojson", "community_plans.geojson", "community_plan.geojson"],
+    "council_district": ["council_district.geojson", "council_districts.geojson"],
+    "zipcode": ["zipcode.geojson", "zipcodes.geojson", "zcta.geojson"],
 }
 COMPONENT_COLUMNS = [
     "backlog_component",
@@ -48,18 +56,6 @@ def load_hotspots_data() -> pd.DataFrame:
         ).fetchdf()
 
 
-@st.cache_data(ttl=300)
-def load_daily_metrics_data() -> pd.DataFrame:
-    with duckdb.connect(str(DB_PATH), read_only=True) as conn:
-        return conn.execute(
-            """
-            select *
-            from main.fct_neighborhood_daily_metrics
-            order by metric_date
-            """
-        ).fetchdf()
-
-
 def unknown_rate(df: pd.DataFrame, column: str) -> float:
     if df.empty:
         return 0.0
@@ -68,6 +64,79 @@ def unknown_rate(df: pd.DataFrame, column: str) -> float:
 
 def driver_label(row: pd.Series) -> str:
     return COMPONENT_LABELS[row[COMPONENT_COLUMNS].astype(float).idxmax()]
+
+
+def prior_week_average(trend_df: pd.DataFrame, value_column: str, latest: pd.Timestamp) -> float | None:
+    prior_week = trend_df[
+        (trend_df["as_of_date"] < latest) & (trend_df["as_of_date"] >= (latest - pd.Timedelta(days=7)))
+    ]
+    if prior_week.empty:
+        return None
+    return float(prior_week[value_column].mean())
+
+
+def load_boundary_geojson(grain_type: str) -> tuple[dict | None, str | None]:
+    candidates = BOUNDARY_FILE_CANDIDATES.get(grain_type, [])
+    for filename in candidates:
+        for boundary_dir in (ALT_BOUNDARY_DIR, BOUNDARY_DIR):
+            boundary_path = boundary_dir / filename
+            if boundary_path.exists():
+                with boundary_path.open("r", encoding="utf-8") as fh:
+                    return json.load(fh), str(boundary_path)
+    return None, None
+
+
+def detect_join_key(geojson: dict, candidate_values: set[str]) -> str | None:
+    features = geojson.get("features", [])
+    if not features:
+        return None
+
+    sample_props = features[0].get("properties", {})
+    best_key = None
+    best_overlap = 0
+    for key in sample_props:
+        geo_values = {
+            str(feature.get("properties", {}).get(key, "")).strip()
+            for feature in features
+            if feature.get("properties", {}).get(key) is not None
+        }
+        overlap = len(candidate_values & geo_values)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_key = key
+    return best_key if best_overlap > 0 else None
+
+
+def normalize_zipcode_value(value: object) -> str:
+    if pd.isna(value):
+        return "Unknown"
+
+    text = str(value).strip()
+    if text == "" or text.lower() == "unknown":
+        return "Unknown"
+
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+
+    if text.isdigit() and len(text) <= 5:
+        return text.zfill(5)
+
+    return text
+
+
+def normalize_zipcode_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    normalized = df.copy()
+    if "zipcode" in normalized.columns:
+        normalized["zipcode"] = normalized["zipcode"].apply(normalize_zipcode_value)
+
+    if {"grain_type", "grain_value"}.issubset(normalized.columns):
+        zip_mask = normalized["grain_type"] == "zipcode"
+        normalized.loc[zip_mask, "grain_value"] = normalized.loc[zip_mask, "grain_value"].apply(normalize_zipcode_value)
+
+    return normalized
 
 
 st.set_page_config(page_title="SD Neighborhood Pulse", layout="wide")
@@ -88,7 +157,8 @@ if not DB_PATH.exists():
 
 frustration = load_frustration_data()
 hotspots = load_hotspots_data()
-daily_metrics = load_daily_metrics_data()
+frustration = normalize_zipcode_columns(frustration)
+hotspots = normalize_zipcode_columns(hotspots)
 
 if frustration.empty:
     st.warning("No frustration index data available yet. Run dbt models first.")
@@ -136,76 +206,14 @@ if current_slice.empty:
     st.info("All rows are currently Unknown after cleaning for this cut; switch grain/window to continue exploration.")
     st.stop()
 
-st.subheader(f"Current Frustration Index ({GRAIN_LABELS[grain]}, {window}-day)")
-col1, col2 = st.columns([2, 1])
-
-with col1:
-    if PRESETS[preset_name] is None:
-        st.caption("Custom mode enabled")
-    else:
-        st.caption(f"Preset mode: {preset_name}")
-    top_ranked = current_slice.head(top_n).sort_values("frustration_index", ascending=True)
-    fig_bar = px.bar(
-        top_ranked,
-        x="frustration_index",
-        y="grain_value",
-        orientation="h",
-        color="frustration_index",
-        color_continuous_scale="Reds",
-        title=f"Top {top_n} areas by frustration index",
-        labels={
-            "frustration_index": "Frustration Index (0-100)",
-            "grain_value": GRAIN_LABELS[grain],
-        },
-    )
-    fig_bar.update_layout(height=600, coloraxis_showscale=False)
-    st.plotly_chart(fig_bar, width="stretch")
-
-with col2:
-    st.metric("As of date", str(latest_date))
-    st.metric("Rows in current cut", int(len(current_slice)))
-    st.metric(
-        "Median frustration index",
-        f"{current_slice['frustration_index'].median():.2f}" if not current_slice.empty else "n/a",
-    )
-    st.metric(
-        "Highest area now",
-        str(current_slice.iloc[0]["grain_value"]) if not current_slice.empty else "n/a",
-    )
-
-with st.expander("How to read the frustration index", expanded=True):
-    st.markdown(
-        "- The **frustration index** is an equal-weight average of 4 components (0-100 each).\n"
-        "- **Higher is worse** across all components.\n"
-        "- Components: backlog pressure, aging open cases (>14 days), repeat requests, and resolution lag."
-    )
-
-st.subheader("Neighborhood decomposition")
-selected_value = st.selectbox(
-    f"Select a {GRAIN_LABELS[grain]}",
-    options=current_slice["grain_value"].tolist()[:100],
+selected_options = current_slice["grain_value"].tolist()[:100]
+selected_value = st.sidebar.selectbox(
+    f"Focus {GRAIN_LABELS[grain]}",
+    options=selected_options,
+    index=0,
 )
 
 selected_latest = current_slice[current_slice["grain_value"] == selected_value].iloc[0]
-decomposition = pd.DataFrame(
-    {
-        "component": [COMPONENT_LABELS[col] for col in COMPONENT_COLUMNS],
-        "score": [float(selected_latest[col]) for col in COMPONENT_COLUMNS],
-    }
-).sort_values("score", ascending=False)
-fig_decomposition = px.bar(
-    decomposition,
-    x="component",
-    y="score",
-    title=f"Latest component breakdown: {selected_value}",
-    color="score",
-    color_continuous_scale="Reds",
-    labels={"component": "Component", "score": "Component score (0-100)"},
-)
-fig_decomposition.update_layout(showlegend=False, yaxis_title="Component score (0-100)")
-st.plotly_chart(fig_decomposition, width="stretch")
-
-st.subheader("Trend")
 trend = frustration[
     (frustration["window_days"] == window)
     & (frustration["grain_type"] == grain)
@@ -216,122 +224,211 @@ if trend.empty:
     st.info("No trend points available for the selected area.")
     st.stop()
 
-component_selection = st.multiselect(
-    "Select components to overlay",
-    options=COMPONENT_COLUMNS,
-    default=COMPONENT_COLUMNS,
-    format_func=lambda col: COMPONENT_LABELS[col],
+city_slice = frustration[
+    (frustration["window_days"] == window)
+    & (frustration["grain_type"] == grain)
+    & (frustration["grain_value"] != "Unknown")
+]
+city_median_latest = float(current_slice["frustration_index"].median())
+latest_index = float(selected_latest["frustration_index"])
+latest_requests = float(selected_latest["request_count"])
+prior_week_index_avg = prior_week_average(trend, "frustration_index", latest_date)
+prior_week_request_avg = prior_week_average(trend, "request_count", latest_date)
+delta_vs_prior_week = latest_index - prior_week_index_avg if prior_week_index_avg is not None else None
+request_delta_vs_prior_week = latest_requests - prior_week_request_avg if prior_week_request_avg is not None else None
+delta_vs_city_median = latest_index - city_median_latest
+top_driver = driver_label(selected_latest)
+
+st.subheader("What changed this week")
+kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+kpi1.metric("Selected area", selected_value)
+kpi2.metric(
+    "Frustration index",
+    f"{latest_index:.2f}",
+    delta=(f"{delta_vs_prior_week:+.2f} vs prior 7d avg" if delta_vs_prior_week is not None else None),
+)
+kpi3.metric(
+    "Vs city median",
+    f"{delta_vs_city_median:+.2f}",
+    delta=f"city median {city_median_latest:.2f}",
+)
+kpi4.metric(
+    "Requests",
+    f"{int(latest_requests)}",
+    delta=(f"{request_delta_vs_prior_week:+.1f} vs prior 7d avg" if request_delta_vs_prior_week is not None else None),
+)
+if delta_vs_prior_week is None:
+    st.caption("Not enough history yet for a complete prior 7-day baseline.")
+
+st.subheader("Headline insight")
+city_direction = "above" if delta_vs_city_median >= 0 else "below"
+if delta_vs_prior_week is None:
+    weekly_direction_text = "with limited week-over-week history"
+else:
+    weekly_direction_text = "increasing week-over-week" if delta_vs_prior_week >= 0 else "decreasing week-over-week"
+st.markdown(
+    f"**{selected_value} is {abs(delta_vs_city_median):.2f} points {city_direction} the city median, "
+    f"primarily driven by {top_driver}, and is currently {weekly_direction_text}.**"
+)
+st.caption(
+    f"Latest index: {latest_index:.2f} | City median: {city_median_latest:.2f} | "
+    f"Top component score ({top_driver}): {float(selected_latest[COMPONENT_COLUMNS].max()):.2f}"
 )
 
-trend_columns = ["frustration_index", *component_selection]
-trend_long = trend[["as_of_date", *trend_columns]].melt(
-    id_vars=["as_of_date"], value_vars=trend_columns, var_name="metric", value_name="score"
-)
-trend_long["metric_label"] = trend_long["metric"].replace(
-    {"frustration_index": "Frustration Index", **COMPONENT_LABELS}
+st.caption(
+    f"As of {latest_date} | Areas in cut: {len(current_slice)} | "
+    f"Highest area now: {str(current_slice.iloc[0]['grain_value'])}"
 )
 
-fig_trend = px.line(trend_long, x="as_of_date", y="score", color="metric_label", title=f"Index and components trend: {selected_value}")
+st.subheader(f"Current Frustration Index ({GRAIN_LABELS[grain]}, {window}-day)")
+if PRESETS[preset_name] is None:
+    st.caption("Custom mode enabled")
+else:
+    st.caption(f"Preset mode: {preset_name}")
+top_ranked = current_slice.head(top_n).sort_values("frustration_index", ascending=True)
+top_ranked = top_ranked.copy()
+top_ranked["grain_value_display"] = top_ranked["grain_value"].astype(str)
+
+fig_bar = px.bar(
+    top_ranked,
+    x="frustration_index",
+    y="grain_value_display",
+    orientation="h",
+    color="frustration_index",
+    color_continuous_scale="Reds",
+    title=f"Top {top_n} areas by frustration index",
+    labels={
+        "frustration_index": "Frustration Index (0-100)",
+        "grain_value_display": GRAIN_LABELS[grain],
+    },
+)
+fig_bar.update_layout(height=560, coloraxis_showscale=False)
+fig_bar.update_yaxes(type="category")
+st.plotly_chart(fig_bar, width="stretch")
+
+with st.expander("How to read the frustration index", expanded=False):
+    st.markdown(
+        "- The **frustration index** is an equal-weight average of 4 components (0-100 each).\n"
+        "- **Higher is worse** across all components.\n"
+        "- Components: backlog pressure, aging open cases (>14 days), repeat requests, and resolution lag."
+    )
+
+st.subheader("Trend")
+show_city_median = st.checkbox("Overlay city median trend", value=True)
+with st.expander("Optional component overlays", expanded=False):
+    component_selection = st.multiselect(
+        "Select components to overlay",
+        options=COMPONENT_COLUMNS,
+        default=[],
+        format_func=lambda col: COMPONENT_LABELS[col],
+    )
+
+trend_frames = [
+    trend[["as_of_date", "frustration_index"]].rename(columns={"frustration_index": "score"}).assign(metric_label="Frustration Index")
+]
+
+if show_city_median:
+    city_median_trend = (
+        city_slice.groupby("as_of_date", as_index=False)["frustration_index"]
+        .median()
+        .rename(columns={"frustration_index": "score"})
+        .assign(metric_label="City Median")
+    )
+    trend_frames.append(city_median_trend)
+
+if component_selection:
+    component_long = trend[["as_of_date", *component_selection]].melt(
+        id_vars=["as_of_date"],
+        value_vars=component_selection,
+        var_name="metric",
+        value_name="score",
+    )
+    component_long["metric_label"] = component_long["metric"].replace(COMPONENT_LABELS)
+    trend_frames.append(component_long[["as_of_date", "score", "metric_label"]])
+
+trend_long = pd.concat(trend_frames, ignore_index=True)
+fig_trend = px.line(
+    trend_long,
+    x="as_of_date",
+    y="score",
+    color="metric_label",
+    title=f"Frustration trend: {selected_value}",
+)
 fig_trend.update_layout(yaxis_title="Score (0-100)", xaxis_title="As of date", legend_title_text="Series")
 st.plotly_chart(fig_trend, width="stretch")
 
-st.subheader("Known peak drivers (Top N request-volume days)")
-peak_n = st.slider("Peak days to inspect", min_value=3, max_value=15, value=7)
-peak_days = trend.sort_values("request_count", ascending=False).head(peak_n).copy()
-peak_days["driver_component"] = peak_days.apply(driver_label, axis=1)
-peak_display = peak_days[
-        [
-            "as_of_date",
-            "request_count",
-            "frustration_index",
-            "driver_component",
-            "backlog_component",
-            "aging_component",
-            "repeat_component",
-            "resolution_component",
-        ]
-    ].rename(
-    columns={
-        "as_of_date": "As of date",
-        "request_count": "Requests",
-        "frustration_index": "Frustration index",
-        "driver_component": "Primary driver",
-        "backlog_component": "Backlog",
-        "aging_component": "Aging",
-        "repeat_component": "Repeat",
-        "resolution_component": "Resolution",
-    }
-)
-st.dataframe(
-    peak_display.style.format(
-        {
-            "Frustration index": "{:.2f}",
-            "Backlog": "{:.2f}",
-            "Aging": "{:.2f}",
-            "Repeat": "{:.2f}",
-            "Resolution": "{:.2f}",
-        }
-    ),
-    width="stretch",
-)
-
-st.subheader("Data quality watch")
-quality_slice = daily_metrics[daily_metrics["grain_type"] == grain].copy()
-quality_slice["is_unknown"] = quality_slice["grain_value"] == "Unknown"
-quality_total = quality_slice.groupby("metric_date", as_index=False)["request_count"].sum().rename(columns={"request_count": "request_count"})
-quality_unknown = (
-    quality_slice[quality_slice["is_unknown"]]
-    .groupby("metric_date", as_index=False)["request_count"]
-    .sum()
-    .rename(columns={"request_count": "unknown_request_count"})
-)
-quality_trend = quality_total.merge(quality_unknown, on="metric_date", how="left")
-quality_trend["unknown_request_count"] = quality_trend["unknown_request_count"].fillna(0)
-quality_trend["unknown_request_rate_pct"] = (
-    quality_trend["unknown_request_count"] / quality_trend["request_count"].where(quality_trend["request_count"] != 0, 1)
-) * 100
-fig_quality = px.line(
-    quality_trend,
-    x="metric_date",
-    y="unknown_request_rate_pct",
-    title=f"Unknown-rate trend ({GRAIN_LABELS[grain]})",
-    labels={"metric_date": "Date", "unknown_request_rate_pct": "Unknown request rate (%)"},
-)
-fig_quality.update_layout(yaxis_ticksuffix="%")
-st.plotly_chart(fig_quality, width="stretch")
-
 st.subheader("Hotspots")
-hotspot_slice = hotspots[hotspots["window_days"] == window].head(200)
-show_technical = st.checkbox("Show technical hotspot fields", value=False)
-base_hotspot_columns = [
-    "comm_plan_name",
-    "council_district",
-    "zipcode",
-    "request_count",
-    "open_ratio_pct",
-    "dominant_service_name",
-]
-technical_hotspot_columns = ["centroid_latitude", "centroid_longitude", "lat_bin", "lon_bin", "cluster_id"]
-display_columns = base_hotspot_columns + technical_hotspot_columns if show_technical else base_hotspot_columns
-hotspot_display = hotspot_slice[display_columns].rename(
-    columns={
-        "comm_plan_name": "Community Plan",
-        "council_district": "Council District",
-        "zipcode": "ZIP Code",
-        "request_count": "Requests",
-        "open_ratio_pct": "Open ratio (%)",
-        "dominant_service_name": "Dominant service",
-        "centroid_latitude": "Centroid lat",
-        "centroid_longitude": "Centroid lon",
-        "lat_bin": "Lat bin",
-        "lon_bin": "Lon bin",
-        "cluster_id": "Cluster ID",
-    }
-)
-st.dataframe(
-    hotspot_display.style.format({"Open ratio (%)": "{:.2f}"}),
-    width="stretch",
-)
+hotspot_slice = hotspots[hotspots["window_days"] == window].copy()
+hotspot_slice["grain_value"] = hotspot_slice[grain].fillna("Unknown")
+hotspot_slice = hotspot_slice[hotspot_slice["grain_value"] != "Unknown"]
+geojson, geojson_path = load_boundary_geojson(grain)
+boundary_join_key = None
+if geojson is not None:
+    boundary_join_key = detect_join_key(geojson, set(current_slice["grain_value"].astype(str)))
+
+if geojson is not None and boundary_join_key is not None:
+    choropleth_data = current_slice[["grain_value", "frustration_index"]].copy()
+    fig_choropleth = px.choropleth_map(
+        choropleth_data,
+        geojson=geojson,
+        locations="grain_value",
+        featureidkey=f"properties.{boundary_join_key}",
+        color="frustration_index",
+        color_continuous_scale="Reds",
+        map_style="carto-positron",
+        zoom=9.5,
+        center={"lat": 32.7157, "lon": -117.1611},
+        opacity=0.7,
+        labels={"frustration_index": "Frustration Index"},
+        title=f"Choropleth by {GRAIN_LABELS[grain]} (latest {window}-day index)",
+    )
+    fig_choropleth.update_layout(margin={"r": 0, "t": 50, "l": 0, "b": 0})
+    st.plotly_chart(fig_choropleth, width="stretch")
+    st.caption(f"Using boundaries: {geojson_path} (join key: {boundary_join_key})")
+else:
+    if grain == "comm_plan_name":
+        st.info("No community-plan GeoJSON configured yet. Showing hotspot centroid map for now.")
+    elif geojson is None:
+        st.info(
+            f"Choropleth unavailable for {GRAIN_LABELS[grain]}: no boundary GeoJSON found in {ALT_BOUNDARY_DIR} or {BOUNDARY_DIR}. "
+            "Showing centroid bubble map instead."
+        )
+    else:
+        st.info(
+            f"Choropleth unavailable for {GRAIN_LABELS[grain]}: boundary file found but no matching join key. "
+            "Showing centroid bubble map instead."
+        )
+
+    map_points = hotspot_slice.sort_values("request_count", ascending=False).head(800)
+    if map_points.empty:
+        st.warning("No hotspot points available for this filter.")
+    else:
+        fig_points = px.scatter_map(
+            map_points,
+            lat="centroid_latitude",
+            lon="centroid_longitude",
+            size="request_count",
+            color="open_ratio_pct",
+            color_continuous_scale="OrRd",
+            hover_name="grain_value",
+            hover_data={
+                "request_count": True,
+                "open_ratio_pct": ":.2f",
+                "dominant_service_name": True,
+                "comm_plan_name": True,
+                "council_district": True,
+                "zipcode": True,
+                "centroid_latitude": False,
+                "centroid_longitude": False,
+                "grain_value": False,
+            },
+            zoom=10,
+            center={"lat": 32.7157, "lon": -117.1611},
+            map_style="open-street-map",
+            title=f"Hotspot centroids by {GRAIN_LABELS[grain]} ({window}-day)",
+        )
+        fig_points.update_layout(margin={"r": 0, "t": 50, "l": 0, "b": 0})
+        st.plotly_chart(fig_points, width="stretch")
 
 st.info(
     "Manual refresh: run ingest + dbt run/test/snapshot from README before checking this dashboard. "

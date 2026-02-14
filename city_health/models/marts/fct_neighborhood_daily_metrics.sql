@@ -26,7 +26,7 @@ with grain_expanded as (
     select
         requested_date as metric_date,
         'zipcode' as grain_type,
-        zipcode as grain_value,
+        cast(zipcode as varchar) as grain_value,
         is_open,
         derived_case_age_days,
         resolution_days,

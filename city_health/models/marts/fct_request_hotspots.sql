@@ -75,7 +75,7 @@ select
     r.window_days,
     r.comm_plan_name,
     r.council_district,
-    r.zipcode,
+    cast(r.zipcode as varchar) as zipcode,
     r.lat_bin,
     r.lon_bin,
     r.centroid_latitude,

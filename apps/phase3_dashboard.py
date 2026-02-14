@@ -434,7 +434,7 @@ if "weight_initialized" not in st.session_state:
         st.session_state[f"weight_{component}"] = int(value)
     st.session_state["weight_initialized"] = True
 
-if st.sidebar.button("Apply preset", use_container_width=True):
+if st.sidebar.button("Apply preset", width="stretch"):
     for component, value in WEIGHT_PRESETS[preset_name].items():
         st.session_state[f"weight_{component}"] = int(value)
 
@@ -614,7 +614,7 @@ with focused_tab:
                 "recommended_action": "Recommended Action",
             }
         )
-        st.dataframe(action_table, use_container_width=True, hide_index=True)
+        st.dataframe(action_table, width="stretch", hide_index=True)
 
     current_start, current_end, baseline_start, baseline_end = baseline_period_bounds(latest_date, window, baseline_mode)
     baseline_components = trend[
@@ -758,7 +758,7 @@ with global_tab:
             "rank_shift": "Rank Shift (+ rises)",
         }
     )
-    st.dataframe(movers, use_container_width=True, hide_index=True)
+    st.dataframe(movers, width="stretch", hide_index=True)
 
     st.subheader("Hotspots")
     hotspot_slice = hotspots[hotspots["window_days"] == window].copy()

@@ -1,4 +1,5 @@
 import argparse
+import csv
 import logging
 import shutil
 import sys
@@ -14,7 +15,10 @@ SOURCE_REGISTRY = {
     "closed_2025": "https://seshat.datasd.org/get_it_done_reports/get_it_done_requests_closed_2025_datasd.csv",
 }
 
-REQUIRED_COLUMNS = [
+DICTIONARY_PATH = Path("data/dictionaries/get_it_done_dictionary.csv")
+DATASET_SPECIFIC_OPTIONAL_COLUMNS = {"specify_the_issue"}
+
+DEFAULT_REQUIRED_COLUMNS = [
     "service_request_id",
     "service_request_parent_id",
     "sap_notification_number",
@@ -39,7 +43,7 @@ REQUIRED_COLUMNS = [
     "floc",
     "public_description",
 ]
-OPTIONAL_COLUMNS = ["specify_the_issue"]
+DEFAULT_OPTIONAL_COLUMNS = ["specify_the_issue"]
 
 
 def configure_logging() -> logging.Logger:
@@ -60,6 +64,31 @@ def configure_logging() -> logging.Logger:
     logger.addHandler(file_handler)
     logger.addHandler(stream_handler)
     return logger
+
+
+def load_schema_contracts(
+    dictionary_path: Path = DICTIONARY_PATH,
+    dataset_specific_optional: set[str] = DATASET_SPECIFIC_OPTIONAL_COLUMNS,
+) -> tuple[list[str], list[str]]:
+    if not dictionary_path.exists():
+        raise FileNotFoundError(f"dictionary file not found: {dictionary_path}")
+
+    fields: list[str] = []
+    with dictionary_path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if "field" not in (reader.fieldnames or []):
+            raise ValueError("dictionary missing 'field' column")
+        for row in reader:
+            field_name = (row.get("field") or "").strip()
+            if field_name:
+                fields.append(field_name)
+
+    if not fields:
+        raise ValueError("dictionary contains no fields")
+
+    optional_columns = [field for field in fields if field in dataset_specific_optional]
+    required_columns = [field for field in fields if field not in dataset_specific_optional]
+    return required_columns, optional_columns
 
 
 def build_paths(source_key: str, run_date: str) -> tuple[Path, Path]:
@@ -108,6 +137,8 @@ def process_source(
     run_date: str,
     force: bool,
     dry_run: bool,
+    required_columns: list[str],
+    optional_columns: list[str],
     logger: logging.Logger,
 ) -> bool:
     archive_path, latest_path = build_paths(source_key, run_date)
@@ -123,7 +154,7 @@ def process_source(
             return True
 
         if archive_path.exists() and not force:
-            validation = validate_columns(archive_path, REQUIRED_COLUMNS, OPTIONAL_COLUMNS)
+            validation = validate_columns(archive_path, required_columns, optional_columns)
             logger.info(
                 "source=%s step=skip_download reason=archive_exists sample_rows=%s missing_optional=%s",
                 source_key,
@@ -137,7 +168,7 @@ def process_source(
                 download_csv(url, archive_path)
                 logger.info("source=%s step=download_complete path=%s", source_key, archive_path)
 
-            validation = validate_columns(archive_path, REQUIRED_COLUMNS, OPTIONAL_COLUMNS)
+            validation = validate_columns(archive_path, required_columns, optional_columns)
             logger.info(
                 "source=%s step=validated sample_rows=%s missing_optional=%s",
                 source_key,
@@ -175,6 +206,24 @@ def ingest_data() -> int:
     args = parse_args()
     logger = configure_logging()
 
+    try:
+        required_columns, optional_columns = load_schema_contracts()
+        logger.info(
+            "step=schema_contract_loaded required_count=%s optional_count=%s dictionary=%s",
+            len(required_columns),
+            len(optional_columns),
+            DICTIONARY_PATH,
+        )
+    except Exception as exc:  # noqa: BLE001
+        required_columns = DEFAULT_REQUIRED_COLUMNS
+        optional_columns = DEFAULT_OPTIONAL_COLUMNS
+        logger.warning(
+            "step=schema_contract_fallback reason=%s required_count=%s optional_count=%s",
+            exc,
+            len(required_columns),
+            len(optional_columns),
+        )
+
     if args.source == "all":
         selected_sources = list(SOURCE_REGISTRY.items())
     else:
@@ -188,6 +237,8 @@ def ingest_data() -> int:
             run_date=args.date,
             force=args.force,
             dry_run=args.dry_run,
+            required_columns=required_columns,
+            optional_columns=optional_columns,
             logger=logger,
         )
         if not success:

@@ -6,6 +6,23 @@ import plotly.express as px
 import streamlit as st
 
 DB_PATH = Path("data/db/city_health.duckdb")
+GRAIN_LABELS = {
+    "comm_plan_name": "Community Plan",
+    "council_district": "Council District",
+    "zipcode": "ZIP Code",
+}
+COMPONENT_COLUMNS = [
+    "backlog_component",
+    "aging_component",
+    "repeat_component",
+    "resolution_component",
+]
+COMPONENT_LABELS = {
+    "backlog_component": "Backlog Pressure",
+    "aging_component": "Aging Open Cases",
+    "repeat_component": "Repeat Requests",
+    "resolution_component": "Resolution Lag",
+}
 
 
 @st.cache_data(ttl=300)
@@ -15,7 +32,6 @@ def load_frustration_data() -> pd.DataFrame:
             """
             select *
             from main.fct_neighborhood_frustration_index
-            where grain_value <> 'Unknown'
             """
         ).fetchdf()
 
@@ -27,15 +43,36 @@ def load_hotspots_data() -> pd.DataFrame:
             """
             select *
             from main.fct_request_hotspots
-            where comm_plan_name <> 'Unknown'
             order by window_days, request_count desc
             """
         ).fetchdf()
 
 
+@st.cache_data(ttl=300)
+def load_daily_metrics_data() -> pd.DataFrame:
+    with duckdb.connect(str(DB_PATH), read_only=True) as conn:
+        return conn.execute(
+            """
+            select *
+            from main.fct_neighborhood_daily_metrics
+            order by metric_date
+            """
+        ).fetchdf()
+
+
+def unknown_rate(df: pd.DataFrame, column: str) -> float:
+    if df.empty:
+        return 0.0
+    return float((df[column] == "Unknown").mean() * 100)
+
+
+def driver_label(row: pd.Series) -> str:
+    return COMPONENT_LABELS[row[COMPONENT_COLUMNS].astype(float).idxmax()]
+
+
 st.set_page_config(page_title="SD Neighborhood Pulse", layout="wide")
 st.title("San Diego Neighborhood Pulse")
-st.caption("Phase 3 v1: frustration index + hotspot monitoring")
+st.caption("Neighborhood service frustration and hotspot monitoring")
 
 PRESETS = {
     "Top 10 Comm Plans (30d)": {"window": 30, "grain": "comm_plan_name", "top_n": 10},
@@ -51,6 +88,7 @@ if not DB_PATH.exists():
 
 frustration = load_frustration_data()
 hotspots = load_hotspots_data()
+daily_metrics = load_daily_metrics_data()
 
 if frustration.empty:
     st.warning("No frustration index data available yet. Run dbt models first.")
@@ -74,28 +112,31 @@ else:
 if PRESETS[preset_name] is not None:
     st.sidebar.write("Adjust manually by switching to **Custom**.")
 
-if PRESETS[preset_name] is not None:
-    share_hashtags = "#SanDiego #NeighborhoodPulse #CivicData"
-    st.sidebar.markdown("### Share-ready caption")
-    st.sidebar.code(
-        f"{preset_name} | As of {latest_date} | Source: Get It Done\n{share_hashtags}",
-        language="text",
-    )
-
-current_slice = frustration[
+current_slice_all = frustration[
     (frustration["window_days"] == window)
     & (frustration["grain_type"] == grain)
     & (frustration["as_of_date"] == latest_date)
 ].sort_values("frustration_index", ascending=False)
+current_slice = current_slice_all[current_slice_all["grain_value"] != "Unknown"]
 
-if current_slice.empty:
+if current_slice_all.empty:
     st.warning(
         f"No rows available for {grain} at {window}-day window on {latest_date}. "
         "Try a different preset or switch to Custom mode."
     )
     st.stop()
 
-st.subheader(f"Current Frustration Index ({grain}, {window}-day)")
+current_unknown_rate = unknown_rate(current_slice_all, "grain_value")
+if current_unknown_rate > 0:
+    st.warning(
+        f"Data quality note: {current_unknown_rate:.1f}% of {GRAIN_LABELS[grain]} rows are mapped to Unknown in this current cut."
+    )
+
+if current_slice.empty:
+    st.info("All rows are currently Unknown after cleaning for this cut; switch grain/window to continue exploration.")
+    st.stop()
+
+st.subheader(f"Current Frustration Index ({GRAIN_LABELS[grain]}, {window}-day)")
 col1, col2 = st.columns([2, 1])
 
 with col1:
@@ -103,16 +144,21 @@ with col1:
         st.caption("Custom mode enabled")
     else:
         st.caption(f"Preset mode: {preset_name}")
+    top_ranked = current_slice.head(top_n).sort_values("frustration_index", ascending=True)
     fig_bar = px.bar(
-        current_slice.head(top_n),
+        top_ranked,
         x="frustration_index",
         y="grain_value",
         orientation="h",
         color="frustration_index",
         color_continuous_scale="Reds",
         title=f"Top {top_n} areas by frustration index",
+        labels={
+            "frustration_index": "Frustration Index (0-100)",
+            "grain_value": GRAIN_LABELS[grain],
+        },
     )
-    fig_bar.update_layout(yaxis={"categoryorder": "total ascending"}, height=600)
+    fig_bar.update_layout(height=600, coloraxis_showscale=False)
     st.plotly_chart(fig_bar, width="stretch")
 
 with col2:
@@ -122,12 +168,44 @@ with col2:
         "Median frustration index",
         f"{current_slice['frustration_index'].median():.2f}" if not current_slice.empty else "n/a",
     )
+    st.metric(
+        "Highest area now",
+        str(current_slice.iloc[0]["grain_value"]) if not current_slice.empty else "n/a",
+    )
 
-st.subheader("Trend")
+with st.expander("How to read the frustration index", expanded=True):
+    st.markdown(
+        "- The **frustration index** is an equal-weight average of 4 components (0-100 each).\n"
+        "- **Higher is worse** across all components.\n"
+        "- Components: backlog pressure, aging open cases (>14 days), repeat requests, and resolution lag."
+    )
+
+st.subheader("Neighborhood decomposition")
 selected_value = st.selectbox(
-    f"Select a {grain}",
+    f"Select a {GRAIN_LABELS[grain]}",
     options=current_slice["grain_value"].tolist()[:100],
 )
+
+selected_latest = current_slice[current_slice["grain_value"] == selected_value].iloc[0]
+decomposition = pd.DataFrame(
+    {
+        "component": [COMPONENT_LABELS[col] for col in COMPONENT_COLUMNS],
+        "score": [float(selected_latest[col]) for col in COMPONENT_COLUMNS],
+    }
+).sort_values("score", ascending=False)
+fig_decomposition = px.bar(
+    decomposition,
+    x="component",
+    y="score",
+    title=f"Latest component breakdown: {selected_value}",
+    color="score",
+    color_continuous_scale="Reds",
+    labels={"component": "Component", "score": "Component score (0-100)"},
+)
+fig_decomposition.update_layout(showlegend=False, yaxis_title="Component score (0-100)")
+st.plotly_chart(fig_decomposition, width="stretch")
+
+st.subheader("Trend")
 trend = frustration[
     (frustration["window_days"] == window)
     & (frustration["grain_type"] == grain)
@@ -138,29 +216,120 @@ if trend.empty:
     st.info("No trend points available for the selected area.")
     st.stop()
 
-fig_trend = px.line(
-    trend,
-    x="as_of_date",
-    y=["frustration_index", "backlog_component", "aging_component", "repeat_component", "resolution_component"],
-    title=f"Index and components trend: {selected_value}",
+component_selection = st.multiselect(
+    "Select components to overlay",
+    options=COMPONENT_COLUMNS,
+    default=COMPONENT_COLUMNS,
+    format_func=lambda col: COMPONENT_LABELS[col],
 )
+
+trend_columns = ["frustration_index", *component_selection]
+trend_long = trend[["as_of_date", *trend_columns]].melt(
+    id_vars=["as_of_date"], value_vars=trend_columns, var_name="metric", value_name="score"
+)
+trend_long["metric_label"] = trend_long["metric"].replace(
+    {"frustration_index": "Frustration Index", **COMPONENT_LABELS}
+)
+
+fig_trend = px.line(trend_long, x="as_of_date", y="score", color="metric_label", title=f"Index and components trend: {selected_value}")
+fig_trend.update_layout(yaxis_title="Score (0-100)", xaxis_title="As of date", legend_title_text="Series")
 st.plotly_chart(fig_trend, width="stretch")
+
+st.subheader("Known peak drivers (Top N request-volume days)")
+peak_n = st.slider("Peak days to inspect", min_value=3, max_value=15, value=7)
+peak_days = trend.sort_values("request_count", ascending=False).head(peak_n).copy()
+peak_days["driver_component"] = peak_days.apply(driver_label, axis=1)
+peak_display = peak_days[
+        [
+            "as_of_date",
+            "request_count",
+            "frustration_index",
+            "driver_component",
+            "backlog_component",
+            "aging_component",
+            "repeat_component",
+            "resolution_component",
+        ]
+    ].rename(
+    columns={
+        "as_of_date": "As of date",
+        "request_count": "Requests",
+        "frustration_index": "Frustration index",
+        "driver_component": "Primary driver",
+        "backlog_component": "Backlog",
+        "aging_component": "Aging",
+        "repeat_component": "Repeat",
+        "resolution_component": "Resolution",
+    }
+)
+st.dataframe(
+    peak_display.style.format(
+        {
+            "Frustration index": "{:.2f}",
+            "Backlog": "{:.2f}",
+            "Aging": "{:.2f}",
+            "Repeat": "{:.2f}",
+            "Resolution": "{:.2f}",
+        }
+    ),
+    width="stretch",
+)
+
+st.subheader("Data quality watch")
+quality_slice = daily_metrics[daily_metrics["grain_type"] == grain].copy()
+quality_slice["is_unknown"] = quality_slice["grain_value"] == "Unknown"
+quality_total = quality_slice.groupby("metric_date", as_index=False)["request_count"].sum().rename(columns={"request_count": "request_count"})
+quality_unknown = (
+    quality_slice[quality_slice["is_unknown"]]
+    .groupby("metric_date", as_index=False)["request_count"]
+    .sum()
+    .rename(columns={"request_count": "unknown_request_count"})
+)
+quality_trend = quality_total.merge(quality_unknown, on="metric_date", how="left")
+quality_trend["unknown_request_count"] = quality_trend["unknown_request_count"].fillna(0)
+quality_trend["unknown_request_rate_pct"] = (
+    quality_trend["unknown_request_count"] / quality_trend["request_count"].where(quality_trend["request_count"] != 0, 1)
+) * 100
+fig_quality = px.line(
+    quality_trend,
+    x="metric_date",
+    y="unknown_request_rate_pct",
+    title=f"Unknown-rate trend ({GRAIN_LABELS[grain]})",
+    labels={"metric_date": "Date", "unknown_request_rate_pct": "Unknown request rate (%)"},
+)
+fig_quality.update_layout(yaxis_ticksuffix="%")
+st.plotly_chart(fig_quality, width="stretch")
 
 st.subheader("Hotspots")
 hotspot_slice = hotspots[hotspots["window_days"] == window].head(200)
+show_technical = st.checkbox("Show technical hotspot fields", value=False)
+base_hotspot_columns = [
+    "comm_plan_name",
+    "council_district",
+    "zipcode",
+    "request_count",
+    "open_ratio_pct",
+    "dominant_service_name",
+]
+technical_hotspot_columns = ["centroid_latitude", "centroid_longitude", "lat_bin", "lon_bin", "cluster_id"]
+display_columns = base_hotspot_columns + technical_hotspot_columns if show_technical else base_hotspot_columns
+hotspot_display = hotspot_slice[display_columns].rename(
+    columns={
+        "comm_plan_name": "Community Plan",
+        "council_district": "Council District",
+        "zipcode": "ZIP Code",
+        "request_count": "Requests",
+        "open_ratio_pct": "Open ratio (%)",
+        "dominant_service_name": "Dominant service",
+        "centroid_latitude": "Centroid lat",
+        "centroid_longitude": "Centroid lon",
+        "lat_bin": "Lat bin",
+        "lon_bin": "Lon bin",
+        "cluster_id": "Cluster ID",
+    }
+)
 st.dataframe(
-    hotspot_slice[
-        [
-            "comm_plan_name",
-            "council_district",
-            "zipcode",
-            "request_count",
-            "open_ratio_pct",
-            "dominant_service_name",
-            "centroid_latitude",
-            "centroid_longitude",
-        ]
-    ],
+    hotspot_display.style.format({"Open ratio (%)": "{:.2f}"}),
     width="stretch",
 )
 

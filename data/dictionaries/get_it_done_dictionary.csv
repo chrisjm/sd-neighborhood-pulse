@@ -1,0 +1,25 @@
+﻿field,description,data_type
+service_request_id,A unique identifier for each request that also serves as a customer's report number for tracking purposes,String
+service_request_parent_id,"If the request has been determined to be a duplicate of an existing, open request, the original request is the parent and subsequent requests are children. All children will have the service_request_id of the parent in this field.",String
+sap_notification_number,"If the request is managed in the City's SAP system, this field will contain a unique identifier for the request used within SAP.",String
+date_requested,The date and time when the service request was made,Datetime
+case_age_days,"The number of days, rounded to the nearest whole day, between request submission and request closure",Integer
+case_record_type,A higher-level grouping of service names that corresponds to the City staff group responsible for responding to the request,String
+service_name,A classification of the type of service to be performed,String
+service_name_detail,Further detail on the type of service to be performed,String
+date_closed,"The date and time when the service request was last modified. For requests with a status of closed or referred, this will be the date the request was closed or referred.",Date
+status,The current state of the service request,String
+lat,Latitude for request location,Float
+lng,Longitude for request location,Float
+street_address,Street address for request location,String
+zipcode,ZIP code for request location,String
+council_district,"If available, the council district where the service was requested",String
+comm_plan_code,"If available, a numeric code corresponding to the community where the service was requested",String
+comm_plan_name,"If available, the community name where the service was requested",String
+park_name,"If applicable, the park or open space area where the service was requested",String
+case_origin,Method by which the requestor submitted the request,String
+referred,"When a case has a status of referred, this field indicates to where the case was referred",String
+iamfloc,City asset functional location in current asset management system,String
+floc,City asset functional location in legacy asset management system,String
+public_description,The description submitted by the reporting party,String
+specify_the_issue,Detail on the type of illegal dumping service request. This field is only available in the illegal dumping specific dataset.,String

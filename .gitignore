@@ -10,3 +10,4 @@ wheels/
 .venv
 data/raw/*
 data/db/*
+notebooks/.ipynb_checkpoints/

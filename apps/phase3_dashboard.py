@@ -62,6 +62,12 @@ WEIGHT_PRESETS = {
         "repeat_component": 30,
         "resolution_component": 35,
     },
+    "Equity Watch": {
+        "backlog_component": 20,
+        "aging_component": 45,
+        "repeat_component": 25,
+        "resolution_component": 10,
+    },
 }
 
 
@@ -239,6 +245,87 @@ def build_service_change_table(
     )
     merged["recommended_action"] = merged["service_name"].apply(recommend_policy_action)
     return merged.sort_values(["absolute_change", "current_count"], ascending=[False, False])
+
+
+def build_intervention_priority_table(
+    current_slice: pd.DataFrame,
+    service_daily: pd.DataFrame,
+    hotspot_slice: pd.DataFrame,
+    grain_type: str,
+    latest_date: pd.Timestamp,
+    current_window_days: int,
+    baseline_mode: str,
+    max_rows: int = 12,
+) -> pd.DataFrame:
+    if current_slice.empty:
+        return pd.DataFrame()
+
+    # Keep business-facing table compact and stable for policy review.
+    focus_areas = current_slice.sort_values("simulated_frustration_index", ascending=False).head(max_rows)
+    hotspot_summary = pd.DataFrame()
+    if not hotspot_slice.empty:
+        hotspot_summary = (
+            hotspot_slice.groupby("grain_value", as_index=False)
+            .agg(
+                dominant_service=("dominant_service_name", lambda s: s.mode().iloc[0] if not s.mode().empty else "Unknown"),
+                open_ratio_pct=("open_ratio_pct", "mean"),
+            )
+            .fillna({"dominant_service": "Unknown", "open_ratio_pct": 0.0})
+        )
+
+    rows: list[dict[str, object]] = []
+    for _, area_row in focus_areas.iterrows():
+        area_name = str(area_row["grain_value"])
+        service_change = build_service_change_table(
+            service_daily=service_daily,
+            grain_type=grain_type,
+            selected_value=area_name,
+            latest_date=latest_date,
+            current_window_days=current_window_days,
+            baseline_mode=baseline_mode,
+        )
+
+        if service_change.empty:
+            trend_pct = None
+            suggested_action = "Insufficient service-level baseline data."
+            service_name = "Unknown"
+        else:
+            top_service = service_change.iloc[0]
+            service_name = str(top_service["service_name"])
+            trend_pct = top_service["pct_change"]
+            suggested_action = str(top_service["recommended_action"])
+
+        row = {
+            "Area": area_name,
+            "Simulated Index": round(float(area_row["simulated_frustration_index"]), 2),
+            "Aging Burden": round(float(area_row["aging_component"]), 2),
+            "Dominant Service": service_name,
+            "Trend %": trend_pct,
+            "Open Ratio %": None,
+            "Suggested Action": suggested_action,
+        }
+        rows.append(row)
+
+    output = pd.DataFrame(rows)
+    if not hotspot_summary.empty:
+        output = output.merge(
+            hotspot_summary.rename(columns={"grain_value": "Area", "dominant_service": "Hotspot Dominant Service"}),
+            on="Area",
+            how="left",
+        )
+        output["Dominant Service"] = output["Dominant Service"].where(
+            output["Dominant Service"] != "Unknown", output["Hotspot Dominant Service"]
+        )
+        output["Open Ratio %"] = output["open_ratio_pct"]
+        output = output.drop(columns=["Hotspot Dominant Service", "open_ratio_pct"])
+
+    output["Trend %"] = output["Trend %"].map(
+        lambda value: "new" if value is None or pd.isna(value) else f"{float(value):+.1f}%"
+    )
+    output["Open Ratio %"] = output["Open Ratio %"].map(
+        lambda value: "n/a" if value is None or pd.isna(value) else f"{float(value):.1f}%"
+    )
+    return output
 
 
 def load_boundary_geojson(grain_type: str) -> tuple[dict | None, str | None]:
@@ -428,6 +515,7 @@ if grain == "comm_plan_name":
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Policy Tuning Lab")
+# CHANGE ME: Keep presets + active slider weights visible so policy can hard-code final values later.
 preset_name = st.sidebar.selectbox("Weight preset", options=list(WEIGHT_PRESETS.keys()), index=0)
 if "weight_initialized" not in st.session_state:
     for component, value in WEIGHT_PRESETS["Balanced (v1)"].items():
@@ -760,10 +848,26 @@ with global_tab:
     )
     st.dataframe(movers, width="stretch", hide_index=True)
 
-    st.subheader("Hotspots")
+    st.subheader("Where to intervene first")
     hotspot_slice = hotspots[hotspots["window_days"] == window].copy()
     hotspot_slice["grain_value"] = hotspot_slice[grain].fillna("Unknown")
     hotspot_slice = hotspot_slice[hotspot_slice["grain_value"] != "Unknown"]
+    intervention_table = build_intervention_priority_table(
+        current_slice=current_slice,
+        service_daily=service_daily,
+        hotspot_slice=hotspot_slice,
+        grain_type=grain,
+        latest_date=latest_date,
+        current_window_days=window,
+        baseline_mode=baseline_mode,
+        max_rows=min(top_n, 12),
+    )
+    if intervention_table.empty:
+        st.info("Intervention table unavailable for this cut.")
+    else:
+        st.dataframe(intervention_table, width="stretch", hide_index=True)
+
+    st.subheader("Hotspots")
     geojson, geojson_path = load_boundary_geojson(grain)
     boundary_join_key = None
     if geojson is not None:
@@ -771,7 +875,7 @@ with global_tab:
         boundary_join_key = detect_join_key(geojson, set(current_slice["grain_value"].astype(str)), grain)
 
     if geojson is not None and boundary_join_key is not None:
-        choropleth_data = current_slice[["grain_value", "frustration_index"]].copy()
+        choropleth_data = current_slice[["grain_value", ranking_column]].copy()
         if "grain_geo_value" in current_slice.columns:
             choropleth_data["grain_geo_value"] = current_slice["grain_geo_value"].values
         location_column = "grain_value"
@@ -801,14 +905,14 @@ with global_tab:
             geojson=geojson,
             locations=location_column,
             featureidkey=f"properties.{boundary_join_key}",
-            color="frustration_index",
+            color=ranking_column,
             color_continuous_scale="Reds",
             map_style="carto-positron",
             zoom=9.5,
             center={"lat": 32.7157, "lon": -117.1611},
             opacity=0.7,
-            labels={"frustration_index": "Frustration Index"},
-            title=f"Choropleth by {GRAIN_LABELS[grain]} (latest {window}-day index)",
+            labels={ranking_column: "Frustration Index"},
+            title=f"Choropleth by {GRAIN_LABELS[grain]} (latest {window}-day simulated index)",
         )
         fig_choropleth.update_layout(margin={"r": 0, "t": 50, "l": 0, "b": 0})
         st.plotly_chart(fig_choropleth, width="stretch")

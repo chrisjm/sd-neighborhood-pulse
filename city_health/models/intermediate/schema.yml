@@ -1,0 +1,40 @@
+version: 2
+
+models:
+  - name: int_requests_geo_clean
+    description: Cleaned request-level geography and base lifecycle fields for downstream analytics.
+    columns:
+      - name: service_request_id
+        tests:
+          - not_null
+      - name: source_dataset
+        tests:
+          - not_null
+      - name: requested_date
+        tests:
+          - not_null
+      - name: latitude
+        tests:
+          - not_null
+      - name: longitude
+        tests:
+          - not_null
+      - name: comm_plan_name
+        tests:
+          - not_null
+      - name: council_district
+        tests:
+          - not_null
+      - name: zipcode
+        tests:
+          - not_null
+
+  - name: int_requests_enriched_time
+    description: Date-grained enriched request data with derived resolution and lifecycle indicators.
+    columns:
+      - name: requested_week
+        tests:
+          - not_null
+      - name: requested_month
+        tests:
+          - not_null

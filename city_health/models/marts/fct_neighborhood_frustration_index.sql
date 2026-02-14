@@ -1,6 +1,9 @@
 with raw_metrics as (
     select * from {{ ref('fct_neighborhood_daily_metrics') }}
 ),
+comm_plan_lookup as (
+    select * from {{ ref('int_comm_plan_geo_lookup') }}
+),
 grains as (
     select distinct grain_type, grain_value
     from raw_metrics
@@ -133,11 +136,43 @@ component_scores as (
         case when request_count = 0 then 0 else (duplicate_child_request_count * 1.0 / request_count) * 100 end as repeat_component,
         least(100.0, coalesce(avg_resolution_days, 0) / 30.0 * 100.0) as resolution_component
     from windowed
+),
+component_scores_mapped as (
+    select
+        c.*,
+        case
+            when c.grain_type = 'comm_plan_name'
+                then coalesce(l.comm_plan_geo_name, c.grain_value)
+            else c.grain_value
+        end as grain_geo_value
+    from component_scores c
+    left join comm_plan_lookup l
+      on c.grain_type = 'comm_plan_name'
+     and case
+            when trim(
+                regexp_replace(
+                    regexp_replace(lower(replace(c.grain_value, '&', ' and ')), '[^a-z0-9 ]+', ' ', 'g'),
+                    '\\s+',
+                    ' ',
+                    'g'
+                )
+            ) like 'reserve area%'
+                then 'reserve'
+            else trim(
+                regexp_replace(
+                    regexp_replace(lower(replace(c.grain_value, '&', ' and ')), '[^a-z0-9 ]+', ' ', 'g'),
+                    '\\s+',
+                    ' ',
+                    'g'
+                )
+            )
+        end = l.comm_plan_normalized
 )
 select
     as_of_date,
     grain_type,
     grain_value,
+    grain_geo_value,
     case when grain_type = 'comm_plan_name' then true else false end as is_primary_grain,
     window_days,
     request_count,
@@ -150,4 +185,4 @@ select
     round(repeat_component, 2) as repeat_component,
     round(resolution_component, 2) as resolution_component,
     round((backlog_component + aging_component + repeat_component + resolution_component) / 4.0, 2) as frustration_index
-from component_scores
+from component_scores_mapped

@@ -462,13 +462,18 @@ if geojson is not None:
 
 if geojson is not None and boundary_join_key is not None:
     choropleth_data = current_slice[["grain_value", "frustration_index"]].copy()
+    if "grain_geo_value" in current_slice.columns:
+        choropleth_data["grain_geo_value"] = current_slice["grain_geo_value"].values
     location_column = "grain_value"
 
     if grain == "comm_plan_name":
-        comm_plan_lookup = build_geojson_join_lookup(geojson, boundary_join_key, grain)
-        choropleth_data["join_location"] = choropleth_data["grain_value"].apply(
-            lambda value: comm_plan_lookup.get(normalize_join_value(value, grain))
-        )
+        if "grain_geo_value" in choropleth_data.columns:
+            choropleth_data["join_location"] = choropleth_data["grain_geo_value"].fillna(choropleth_data["grain_value"])
+        else:
+            comm_plan_lookup = build_geojson_join_lookup(geojson, boundary_join_key, grain)
+            choropleth_data["join_location"] = choropleth_data["grain_value"].apply(
+                lambda value: comm_plan_lookup.get(normalize_join_value(value, grain))
+            )
         choropleth_data = choropleth_data[choropleth_data["join_location"].notna()].copy()
         location_column = "join_location"
 

@@ -37,6 +37,32 @@ COMPONENT_LABELS = {
     "repeat_component": "Repeat Requests",
     "resolution_component": "Resolution Lag",
 }
+BASELINE_LABELS = {
+    "prior_30": "Prior 30 Days",
+    "prior_90": "Prior 90 Days",
+    "yoy": "Year over Year",
+}
+# CHANGE ME: Candidate policy presets for weights. Keep visible/easy to hard-code after policy alignment.
+WEIGHT_PRESETS = {
+    "Balanced (v1)": {
+        "backlog_component": 25,
+        "aging_component": 25,
+        "repeat_component": 25,
+        "resolution_component": 25,
+    },
+    "Resident Experience": {
+        "backlog_component": 35,
+        "aging_component": 40,
+        "repeat_component": 15,
+        "resolution_component": 10,
+    },
+    "Operational Efficiency": {
+        "backlog_component": 20,
+        "aging_component": 15,
+        "repeat_component": 30,
+        "resolution_component": 35,
+    },
+}
 
 
 @st.cache_data(ttl=300)
@@ -48,6 +74,27 @@ def load_frustration_data() -> pd.DataFrame:
             from main.fct_neighborhood_frustration_index
             """
         ).fetchdf()
+
+
+@st.cache_data(ttl=300)
+def load_service_daily_data() -> pd.DataFrame:
+    with duckdb.connect(str(DB_PATH), read_only=True) as conn:
+        try:
+            return conn.execute(
+                """
+                select
+                    requested_date as metric_date,
+                    comm_plan_name,
+                    council_district,
+                    cast(zipcode as varchar) as zipcode,
+                    service_name,
+                    count(*) as request_count
+                from main.int_requests_enriched_time
+                group by 1, 2, 3, 4, 5
+                """
+            ).fetchdf()
+        except duckdb.Error:
+            return pd.DataFrame()
 
 
 @st.cache_data(ttl=300)
@@ -79,6 +126,119 @@ def prior_week_average(trend_df: pd.DataFrame, value_column: str, latest: pd.Tim
     if prior_week.empty:
         return None
     return float(prior_week[value_column].mean())
+
+
+def normalize_weights(raw_weights: dict[str, float]) -> dict[str, float]:
+    total = sum(raw_weights.values())
+    if total <= 0:
+        equal_weight = 1.0 / len(COMPONENT_COLUMNS)
+        return {column: equal_weight for column in COMPONENT_COLUMNS}
+    return {column: raw_weights.get(column, 0.0) / total for column in COMPONENT_COLUMNS}
+
+
+def calculate_simulated_index(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    scored = df.copy()
+    weighted_sum = sum(scored[column].astype(float) * weights.get(column, 0.0) for column in COMPONENT_COLUMNS)
+    scored["simulated_frustration_index"] = weighted_sum.round(2)
+    return scored
+
+
+def baseline_period_bounds(
+    latest_date: pd.Timestamp, current_window_days: int, baseline_mode: str
+) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    current_end = latest_date
+    current_start = latest_date - pd.Timedelta(days=current_window_days - 1)
+
+    if baseline_mode == "prior_30":
+        baseline_days = 30
+        baseline_end = current_start - pd.Timedelta(days=1)
+        baseline_start = baseline_end - pd.Timedelta(days=baseline_days - 1)
+    elif baseline_mode == "prior_90":
+        baseline_days = 90
+        baseline_end = current_start - pd.Timedelta(days=1)
+        baseline_start = baseline_end - pd.Timedelta(days=baseline_days - 1)
+    else:
+        baseline_start = current_start - pd.Timedelta(days=365)
+        baseline_end = current_end - pd.Timedelta(days=365)
+
+    return current_start, current_end, baseline_start, baseline_end
+
+
+def grain_column(grain_type: str) -> str:
+    return {
+        "comm_plan_name": "comm_plan_name",
+        "council_district": "council_district",
+        "zipcode": "zipcode",
+    }[grain_type]
+
+
+def recommend_policy_action(service_name: str) -> str:
+    # CHANGE ME: Policy playbook mapping can be hard-coded once stakeholders finalize interventions.
+    service_text = str(service_name).lower()
+    if "pothole" in service_text:
+        return "Prioritize arterial-first pothole crews and rebalance dispatch zones."
+    if "graffiti" in service_text:
+        return "Expand rapid-removal routing and hotspot patrol scheduling."
+    if "trash" in service_text or "dump" in service_text:
+        return "Increase bulky-item pickup capacity and target chronic dumping blocks."
+    if "street light" in service_text or "light" in service_text:
+        return "Bundle corridor lighting fixes with outage-cluster escalation."
+    return "Audit staffing/route bottlenecks and assign a 2-week service recovery sprint."
+
+
+def build_service_change_table(
+    service_daily: pd.DataFrame,
+    grain_type: str,
+    selected_value: str,
+    latest_date: pd.Timestamp,
+    current_window_days: int,
+    baseline_mode: str,
+) -> pd.DataFrame:
+    if service_daily.empty:
+        return pd.DataFrame()
+
+    selected_column = grain_column(grain_type)
+    area = service_daily[service_daily[selected_column].astype(str) == str(selected_value)].copy()
+    if area.empty:
+        return pd.DataFrame()
+
+    area["metric_date"] = pd.to_datetime(area["metric_date"])
+    current_start, current_end, baseline_start, baseline_end = baseline_period_bounds(
+        latest_date, current_window_days, baseline_mode
+    )
+
+    current_mask = (area["metric_date"] >= current_start) & (area["metric_date"] <= current_end)
+    baseline_mask = (area["metric_date"] >= baseline_start) & (area["metric_date"] <= baseline_end)
+
+    current_counts = (
+        area.loc[current_mask]
+        .groupby("service_name", as_index=False)["request_count"]
+        .sum()
+        .rename(columns={"request_count": "current_count"})
+    )
+    baseline_counts = (
+        area.loc[baseline_mask]
+        .groupby("service_name", as_index=False)["request_count"]
+        .sum()
+        .rename(columns={"request_count": "baseline_count"})
+    )
+
+    if current_counts.empty:
+        return pd.DataFrame()
+
+    merged = current_counts.merge(baseline_counts, on="service_name", how="left").fillna({"baseline_count": 0})
+    merged["absolute_change"] = merged["current_count"] - merged["baseline_count"]
+    merged["pct_change"] = merged.apply(
+        lambda row: None
+        if row["baseline_count"] == 0
+        else ((row["current_count"] - row["baseline_count"]) / row["baseline_count"]) * 100,
+        axis=1,
+    )
+    merged["recommended_action"] = merged["service_name"].apply(recommend_policy_action)
+    return merged.sort_values(["absolute_change", "current_count"], ascending=[False, False])
 
 
 def load_boundary_geojson(grain_type: str) -> tuple[dict | None, str | None]:
@@ -233,8 +393,14 @@ if not DB_PATH.exists():
 
 frustration = load_frustration_data()
 hotspots = load_hotspots_data()
+service_daily = load_service_daily_data()
 frustration = normalize_zipcode_columns(frustration)
 hotspots = normalize_zipcode_columns(hotspots)
+service_daily = normalize_zipcode_columns(service_daily)
+
+frustration["as_of_date"] = pd.to_datetime(frustration["as_of_date"])
+if not service_daily.empty:
+    service_daily["metric_date"] = pd.to_datetime(service_daily["metric_date"])
 
 if frustration.empty:
     st.warning("No frustration index data available yet. Run dbt models first.")
@@ -245,6 +411,12 @@ latest_date_display = pd.to_datetime(latest_date).date().isoformat()
 st.sidebar.header("Filters")
 window = st.sidebar.selectbox("Window (days)", [30, 90], index=0)
 grain = st.sidebar.selectbox("Neighborhood grain", ["comm_plan_name", "council_district", "zipcode"], index=0)
+baseline_mode = st.sidebar.selectbox(
+    "Comparison baseline",
+    options=list(BASELINE_LABELS.keys()),
+    format_func=lambda value: BASELINE_LABELS[value],
+    index=0,
+)
 st.sidebar.caption("Showing all areas for the selected grain and window.")
 include_reserve = False
 if grain == "comm_plan_name":
@@ -254,11 +426,44 @@ if grain == "comm_plan_name":
     else:
         st.sidebar.caption("Reserve is excluded by default. Enable the checkbox to include it.")
 
+st.sidebar.markdown("---")
+st.sidebar.subheader("Policy Tuning Lab")
+preset_name = st.sidebar.selectbox("Weight preset", options=list(WEIGHT_PRESETS.keys()), index=0)
+if "weight_initialized" not in st.session_state:
+    for component, value in WEIGHT_PRESETS["Balanced (v1)"].items():
+        st.session_state[f"weight_{component}"] = int(value)
+    st.session_state["weight_initialized"] = True
+
+if st.sidebar.button("Apply preset", use_container_width=True):
+    for component, value in WEIGHT_PRESETS[preset_name].items():
+        st.session_state[f"weight_{component}"] = int(value)
+
+with st.sidebar.expander("Tune component weights", expanded=False):
+    raw_weights = {}
+    for component in COMPONENT_COLUMNS:
+        raw_weights[component] = float(
+            st.slider(
+                COMPONENT_LABELS[component],
+                min_value=0,
+                max_value=100,
+                step=1,
+                key=f"weight_{component}",
+            )
+        )
+
+weights = normalize_weights(raw_weights)
+weight_caption = " | ".join(
+    f"{COMPONENT_LABELS[column]}: {weights[column] * 100:.1f}%" for column in COMPONENT_COLUMNS
+)
+st.sidebar.caption(f"Normalized active weights -> {weight_caption}")
+ranking_column = "simulated_frustration_index"
+
 current_slice_all = frustration[
     (frustration["window_days"] == window)
     & (frustration["grain_type"] == grain)
     & (frustration["as_of_date"] == latest_date)
-].sort_values("frustration_index", ascending=False)
+]
+current_slice_all = calculate_simulated_index(current_slice_all, weights).sort_values(ranking_column, ascending=False)
 current_slice = current_slice_all[current_slice_all["grain_value"] != "Unknown"]
 if grain == "comm_plan_name" and not include_reserve:
     current_slice = current_slice[~current_slice["grain_value"].apply(is_reserve_comm_plan)]
@@ -306,6 +511,7 @@ trend = frustration[
     & (frustration["grain_type"] == grain)
     & (frustration["grain_value"] == selected_value)
 ].sort_values("as_of_date")
+trend = calculate_simulated_index(trend, weights)
 
 if trend.empty:
     st.info("No trend points available for the selected area.")
@@ -318,10 +524,11 @@ city_slice = frustration[
 ]
 if grain == "comm_plan_name" and not include_reserve:
     city_slice = city_slice[~city_slice["grain_value"].apply(is_reserve_comm_plan)]
-city_median_latest = float(current_slice["frustration_index"].median())
-latest_index = float(selected_latest["frustration_index"])
+city_slice = calculate_simulated_index(city_slice, weights)
+city_median_latest = float(current_slice[ranking_column].median())
+latest_index = float(selected_latest[ranking_column])
 latest_requests = float(selected_latest["request_count"])
-prior_week_index_avg = prior_week_average(trend, "frustration_index", latest_date)
+prior_week_index_avg = prior_week_average(trend, ranking_column, latest_date)
 prior_week_request_avg = prior_week_average(trend, "request_count", latest_date)
 delta_vs_prior_week = latest_index - prior_week_index_avg if prior_week_index_avg is not None else None
 request_delta_vs_prior_week = latest_requests - prior_week_request_avg if prior_week_request_avg is not None else None
@@ -367,6 +574,77 @@ with focused_tab:
         f"Top component score ({top_driver}): {float(selected_latest[COMPONENT_COLUMNS].max()):.2f}"
     )
 
+    st.subheader("Action brief: what to fix next")
+    service_change = build_service_change_table(
+        service_daily=service_daily,
+        grain_type=grain,
+        selected_value=selected_value,
+        latest_date=latest_date,
+        current_window_days=window,
+        baseline_mode=baseline_mode,
+    )
+
+    if service_change.empty:
+        st.info("Service-level trend breakdown unavailable for this selection yet.")
+    else:
+        top_service = service_change.iloc[0]
+        pct_change_value = top_service["pct_change"]
+        if pct_change_value is None or pd.isna(pct_change_value):
+            pct_change_text = "new surge vs baseline"
+        else:
+            pct_change_text = f"{pct_change_value:+.1f}%"
+
+        st.markdown(
+            f"**Priority signal:** {top_service['service_name']} requests are {pct_change_text} "
+            f"(Δ {int(top_service['absolute_change'])}) using {BASELINE_LABELS[baseline_mode]} as baseline."
+        )
+        st.caption(f"Suggested intervention: {top_service['recommended_action']}")
+
+        action_table = service_change.head(8).copy()
+        action_table["pct_change"] = action_table["pct_change"].map(
+            lambda value: "new" if value is None or pd.isna(value) else f"{value:+.1f}%"
+        )
+        action_table = action_table.rename(
+            columns={
+                "service_name": "Service",
+                "current_count": "Current Volume",
+                "baseline_count": f"Baseline Volume ({BASELINE_LABELS[baseline_mode]})",
+                "absolute_change": "Absolute Change",
+                "pct_change": "% Change",
+                "recommended_action": "Recommended Action",
+            }
+        )
+        st.dataframe(action_table, use_container_width=True, hide_index=True)
+
+    current_start, current_end, baseline_start, baseline_end = baseline_period_bounds(latest_date, window, baseline_mode)
+    baseline_components = trend[
+        (trend["as_of_date"] >= baseline_start) & (trend["as_of_date"] <= baseline_end)
+    ]
+    if not baseline_components.empty:
+        baseline_component_values = baseline_components[COMPONENT_COLUMNS].mean()
+        component_delta = pd.DataFrame(
+            {
+                "component": COMPONENT_COLUMNS,
+                "current_score": [float(selected_latest[column]) for column in COMPONENT_COLUMNS],
+                "baseline_score": [float(baseline_component_values[column]) for column in COMPONENT_COLUMNS],
+            }
+        )
+        component_delta["delta"] = component_delta["current_score"] - component_delta["baseline_score"]
+        component_delta["weighted_delta"] = component_delta["component"].map(weights) * component_delta["delta"]
+        component_delta["component_label"] = component_delta["component"].replace(COMPONENT_LABELS)
+
+        fig_component_delta = px.bar(
+            component_delta.sort_values("weighted_delta", ascending=False),
+            x="weighted_delta",
+            y="component_label",
+            orientation="h",
+            color="weighted_delta",
+            color_continuous_scale="RdYlGn_r",
+            title=f"What moved the score vs {BASELINE_LABELS[baseline_mode]}",
+            labels={"weighted_delta": "Weighted contribution delta", "component_label": "Component"},
+        )
+        st.plotly_chart(fig_component_delta, width="stretch")
+
     st.subheader("Trend")
     show_city_median = st.checkbox("Overlay city median trend", value=True)
     with st.expander("Optional component overlays", expanded=False):
@@ -378,14 +656,12 @@ with focused_tab:
         )
 
     trend_frames = [
-        trend[["as_of_date", "frustration_index"]].rename(columns={"frustration_index": "score"}).assign(metric_label="Frustration Index")
+        trend[["as_of_date", ranking_column]].rename(columns={ranking_column: "score"}).assign(metric_label="Frustration Index (simulated)")
     ]
 
     if show_city_median:
         city_median_trend = (
-            city_slice.groupby("as_of_date", as_index=False)["frustration_index"]
-            .median()
-            .rename(columns={"frustration_index": "score"})
+            city_slice.groupby("as_of_date", as_index=False)[ranking_column].median().rename(columns={ranking_column: "score"})
             .assign(metric_label="City Median")
         )
         trend_frames.append(city_median_trend)
@@ -422,23 +698,23 @@ with global_tab:
         reserve_note = "included" if include_reserve else "excluded"
         st.caption(f"Reserve area is {reserve_note} in this community plan view.")
     top_ranked = (
-        current_slice.sort_values("frustration_index", ascending=False)
+        current_slice.sort_values(ranking_column, ascending=False)
         .head(top_n)
-        .sort_values("frustration_index", ascending=True)
+        .sort_values(ranking_column, ascending=True)
     )
     top_ranked = top_ranked.copy()
     top_ranked["grain_value_display"] = top_ranked["grain_value"].astype(str)
 
     fig_bar = px.bar(
         top_ranked,
-        x="frustration_index",
+        x=ranking_column,
         y="grain_value_display",
         orientation="h",
-        color="frustration_index",
+        color=ranking_column,
         color_continuous_scale="Reds",
-        title=f"Top {top_n} areas by frustration index",
+        title=f"Top {top_n} areas by simulated frustration index",
         labels={
-            "frustration_index": "Frustration Index (0-100)",
+            ranking_column: "Frustration Index (0-100)",
             "grain_value_display": GRAIN_LABELS[grain],
         },
     )
@@ -449,10 +725,40 @@ with global_tab:
 
     with st.expander("How to read the frustration index", expanded=False):
         st.markdown(
-            "- The **frustration index** is an equal-weight average of 4 components (0-100 each).\n"
+            "- The **frustration index** is currently a weighted average of 4 components (0-100 each).\n"
             "- **Higher is worse** across all components.\n"
-            "- Components: backlog pressure, aging open cases (>14 days), repeat requests, and resolution lag."
+            "- Components: backlog pressure, aging open cases (>14 days), repeat requests, and resolution lag.\n"
+            "- Use **Policy Tuning Lab** to test how different priorities reshape neighborhood rankings."
         )
+
+    baseline_rank = (
+        current_slice.sort_values("frustration_index", ascending=False)[["grain_value", "frustration_index"]]
+        .reset_index(drop=True)
+        .reset_index()
+        .rename(columns={"index": "baseline_rank"})
+    )
+    baseline_rank["baseline_rank"] = baseline_rank["baseline_rank"] + 1
+    simulated_rank = (
+        current_slice.sort_values(ranking_column, ascending=False)[["grain_value", ranking_column]]
+        .reset_index(drop=True)
+        .reset_index()
+        .rename(columns={"index": "simulated_rank"})
+    )
+    simulated_rank["simulated_rank"] = simulated_rank["simulated_rank"] + 1
+    rank_delta = baseline_rank.merge(simulated_rank, on="grain_value", how="inner")
+    rank_delta["rank_shift"] = rank_delta["baseline_rank"] - rank_delta["simulated_rank"]
+
+    st.subheader("Policy tuning impact")
+    movers = rank_delta.reindex(rank_delta["rank_shift"].abs().sort_values(ascending=False).index).head(10)
+    movers = movers.rename(
+        columns={
+            "grain_value": GRAIN_LABELS[grain],
+            "baseline_rank": "Baseline Rank (v1)",
+            "simulated_rank": "Simulated Rank",
+            "rank_shift": "Rank Shift (+ rises)",
+        }
+    )
+    st.dataframe(movers, use_container_width=True, hide_index=True)
 
     st.subheader("Hotspots")
     hotspot_slice = hotspots[hotspots["window_days"] == window].copy()

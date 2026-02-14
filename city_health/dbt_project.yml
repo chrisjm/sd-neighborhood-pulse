@@ -31,9 +31,11 @@ clean-targets:         # directories to be removed by `dbt clean`
 # files using the `{{ config(...) }}` macro.
 models:
   city_health:
-    example:
-      +enabled: false
     sources:
       +materialized: view
     staging:
+      +materialized: table
+    intermediate:
+      +materialized: view
+    marts:
       +materialized: table

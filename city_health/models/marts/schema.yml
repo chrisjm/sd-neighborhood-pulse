@@ -19,6 +19,74 @@ models:
       - name: request_count
         tests:
           - not_null
+      - name: open_request_count
+        tests:
+          - not_null
+      - name: closed_or_referred_count
+        tests:
+          - not_null
+
+  - name: fct_city_daily_metrics
+    description: Citywide daily request pressure metrics (all neighborhoods combined).
+    columns:
+      - name: metric_date
+        tests:
+          - not_null
+      - name: request_count
+        tests:
+          - not_null
+      - name: open_request_count
+        tests:
+          - not_null
+      - name: aging_open_request_count
+        tests:
+          - not_null
+      - name: duplicate_child_request_count
+        tests:
+          - not_null
+      - name: median_resolution_days
+        tests:
+          - not_null
+      - name: closed_request_count
+        tests:
+          - not_null
+      - name: opened_request_count_3d
+        tests:
+          - not_null
+      - name: opened_request_count_7d
+        tests:
+          - not_null
+      - name: closed_request_count_3d
+        tests:
+          - not_null
+      - name: closed_request_count_7d
+        tests:
+          - not_null
+
+  - name: fct_city_service_daily_metrics
+    description: Citywide daily service volume and busy/light day indicators.
+    columns:
+      - name: metric_date
+        tests:
+          - not_null
+      - name: service_name
+        tests:
+          - not_null
+      - name: request_count
+        tests:
+          - not_null
+      - name: is_busy_day
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [true, false]
+      - name: is_light_day
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [true, false]
 
   - name: fct_neighborhood_daily_metrics
     description: Daily request pressure metrics by neighborhood grain (comm plan, district, ZIP).
@@ -38,6 +106,67 @@ models:
       - name: request_count
         tests:
           - not_null
+      - name: open_request_count
+        tests:
+          - not_null
+      - name: aging_open_request_count
+        tests:
+          - not_null
+      - name: duplicate_child_request_count
+        tests:
+          - not_null
+      - name: median_resolution_days
+        tests:
+          - not_null
+      - name: closed_request_count
+        tests:
+          - not_null
+      - name: opened_request_count_3d
+        tests:
+          - not_null
+      - name: opened_request_count_7d
+        tests:
+          - not_null
+      - name: closed_request_count_3d
+        tests:
+          - not_null
+      - name: closed_request_count_7d
+        tests:
+          - not_null
+
+  - name: fct_neighborhood_service_daily_metrics
+    description: Daily service volume and busy/light day indicators by neighborhood grain.
+    columns:
+      - name: metric_date
+        tests:
+          - not_null
+      - name: grain_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['comm_plan_name', 'council_district', 'zipcode']
+      - name: grain_value
+        tests:
+          - not_null
+      - name: service_name
+        tests:
+          - not_null
+      - name: request_count
+        tests:
+          - not_null
+      - name: is_busy_day
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [true, false]
+      - name: is_light_day
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: [true, false]
 
   - name: fct_neighborhood_frustration_index
     description: Rolling 30d/90d frustration index and components by neighborhood grain.

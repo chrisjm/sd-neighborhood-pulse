@@ -1,69 +1,25 @@
-with grain_expanded as (
-    select
-        requested_date,
-        closed_date,
-        'comm_plan_name' as grain_type,
-        comm_plan_name as grain_value,
-        is_open,
-        derived_case_age_days,
-        resolution_days,
-        service_request_parent_id
-    from {{ ref('int_requests_enriched_time') }}
-
-    union all
-
-    select
-        requested_date,
-        closed_date,
-        'council_district' as grain_type,
-        council_district as grain_value,
-        is_open,
-        derived_case_age_days,
-        resolution_days,
-        service_request_parent_id
-    from {{ ref('int_requests_enriched_time') }}
-
-    union all
-
-    select
-        requested_date,
-        closed_date,
-        'zipcode' as grain_type,
-        cast(zipcode as varchar) as grain_value,
-        is_open,
-        derived_case_age_days,
-        resolution_days,
-        service_request_parent_id
-    from {{ ref('int_requests_enriched_time') }}
-),
-requested_daily as (
+with requested_daily as (
     select
         requested_date as metric_date,
-        grain_type,
-        grain_value,
         count(*) as request_count,
         sum(is_open) as open_request_count,
         sum(case when is_open = 1 and derived_case_age_days > 14 then 1 else 0 end) as aging_open_request_count,
         sum(case when service_request_parent_id is not null and trim(service_request_parent_id) <> '' then 1 else 0 end) as duplicate_child_request_count,
         median(resolution_days) as median_resolution_days
-    from grain_expanded
-    group by 1, 2, 3
+    from {{ ref('int_requests_enriched_time') }}
+    group by 1
 ),
 closed_daily as (
     select
         closed_date as metric_date,
-        grain_type,
-        grain_value,
         count(*) as closed_request_count
-    from grain_expanded
+    from {{ ref('int_requests_enriched_time') }}
     where closed_date is not null
-    group by 1, 2, 3
+    group by 1
 ),
 combined as (
     select
         coalesce(r.metric_date, c.metric_date) as metric_date,
-        coalesce(r.grain_type, c.grain_type) as grain_type,
-        coalesce(r.grain_value, c.grain_value) as grain_value,
         coalesce(r.request_count, 0) as request_count,
         coalesce(r.open_request_count, 0) as open_request_count,
         coalesce(r.aging_open_request_count, 0) as aging_open_request_count,
@@ -73,29 +29,23 @@ combined as (
     from requested_daily r
     full outer join closed_daily c
       on r.metric_date = c.metric_date
-     and r.grain_type = c.grain_type
-     and r.grain_value = c.grain_value
 ),
 rolling as (
     select
         *,
         sum(request_count) over (
-            partition by grain_type, grain_value
             order by metric_date
             range between interval '2 days' preceding and current row
         ) as opened_request_count_3d,
         sum(request_count) over (
-            partition by grain_type, grain_value
             order by metric_date
             range between interval '6 days' preceding and current row
         ) as opened_request_count_7d,
         sum(closed_request_count) over (
-            partition by grain_type, grain_value
             order by metric_date
             range between interval '2 days' preceding and current row
         ) as closed_request_count_3d,
         sum(closed_request_count) over (
-            partition by grain_type, grain_value
             order by metric_date
             range between interval '6 days' preceding and current row
         ) as closed_request_count_7d
@@ -103,8 +53,6 @@ rolling as (
 )
 select
     metric_date,
-    grain_type,
-    grain_value,
     request_count,
     open_request_count,
     aging_open_request_count,

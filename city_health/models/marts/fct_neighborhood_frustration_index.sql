@@ -28,7 +28,12 @@ filled_metrics as (
         coalesce(m.open_request_count, 0) as open_request_count,
         coalesce(m.aging_open_request_count, 0) as aging_open_request_count,
         coalesce(m.duplicate_child_request_count, 0) as duplicate_child_request_count,
-        coalesce(m.median_resolution_days, 0) as median_resolution_days
+        coalesce(m.median_resolution_days, 0) as median_resolution_days,
+        coalesce(m.closed_request_count, 0) as closed_request_count,
+        coalesce(m.opened_request_count_3d, 0) as opened_request_count_3d,
+        coalesce(m.opened_request_count_7d, 0) as opened_request_count_7d,
+        coalesce(m.closed_request_count_3d, 0) as closed_request_count_3d,
+        coalesce(m.closed_request_count_7d, 0) as closed_request_count_7d
     from date_spine d
     cross join grains g
     left join raw_metrics m
@@ -66,6 +71,31 @@ rolling as (
             order by metric_date
             rows between 29 preceding and current row
         ) as avg_resolution_days_30d,
+        sum(closed_request_count) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 29 preceding and current row
+        ) as closed_request_count_30d,
+        sum(opened_request_count_3d) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 29 preceding and current row
+        ) as opened_request_count_3d_30d,
+        sum(opened_request_count_7d) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 29 preceding and current row
+        ) as opened_request_count_7d_30d,
+        sum(closed_request_count_3d) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 29 preceding and current row
+        ) as closed_request_count_3d_30d,
+        sum(closed_request_count_7d) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 29 preceding and current row
+        ) as closed_request_count_7d_30d,
         sum(request_count) over (
             partition by grain_type, grain_value
             order by metric_date
@@ -90,7 +120,32 @@ rolling as (
             partition by grain_type, grain_value
             order by metric_date
             rows between 89 preceding and current row
-        ) as avg_resolution_days_90d
+        ) as avg_resolution_days_90d,
+        sum(closed_request_count) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 89 preceding and current row
+        ) as closed_request_count_90d,
+        sum(opened_request_count_3d) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 89 preceding and current row
+        ) as opened_request_count_3d_90d,
+        sum(opened_request_count_7d) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 89 preceding and current row
+        ) as opened_request_count_7d_90d,
+        sum(closed_request_count_3d) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 89 preceding and current row
+        ) as closed_request_count_3d_90d,
+        sum(closed_request_count_7d) over (
+            partition by grain_type, grain_value
+            order by metric_date
+            rows between 89 preceding and current row
+        ) as closed_request_count_7d_90d
     from filled_metrics
 ),
 windowed as (
@@ -103,7 +158,12 @@ windowed as (
         open_request_count_30d as open_request_count,
         aging_open_request_count_30d as aging_open_request_count,
         duplicate_child_request_count_30d as duplicate_child_request_count,
-        avg_resolution_days_30d as avg_resolution_days
+        avg_resolution_days_30d as avg_resolution_days,
+        closed_request_count_30d as closed_request_count,
+        opened_request_count_3d_30d as opened_request_count_3d,
+        opened_request_count_7d_30d as opened_request_count_7d,
+        closed_request_count_3d_30d as closed_request_count_3d,
+        closed_request_count_7d_30d as closed_request_count_7d
     from rolling
 
     union all
@@ -117,7 +177,12 @@ windowed as (
         open_request_count_90d as open_request_count,
         aging_open_request_count_90d as aging_open_request_count,
         duplicate_child_request_count_90d as duplicate_child_request_count,
-        avg_resolution_days_90d as avg_resolution_days
+        avg_resolution_days_90d as avg_resolution_days,
+        closed_request_count_90d as closed_request_count,
+        opened_request_count_3d_90d as opened_request_count_3d,
+        opened_request_count_7d_90d as opened_request_count_7d,
+        closed_request_count_3d_90d as closed_request_count_3d,
+        closed_request_count_7d_90d as closed_request_count_7d
     from rolling
 ),
 component_scores as (
@@ -131,6 +196,11 @@ component_scores as (
         aging_open_request_count,
         duplicate_child_request_count,
         avg_resolution_days,
+        closed_request_count,
+        opened_request_count_3d,
+        opened_request_count_7d,
+        closed_request_count_3d,
+        closed_request_count_7d,
         case when request_count = 0 then 0 else (open_request_count * 1.0 / request_count) * 100 end as backlog_component,
         case when open_request_count = 0 then 0 else (aging_open_request_count * 1.0 / open_request_count) * 100 end as aging_component,
         case when request_count = 0 then 0 else (duplicate_child_request_count * 1.0 / request_count) * 100 end as repeat_component,
@@ -180,6 +250,11 @@ select
     aging_open_request_count,
     duplicate_child_request_count,
     round(avg_resolution_days, 2) as avg_resolution_days,
+    closed_request_count,
+    opened_request_count_3d,
+    opened_request_count_7d,
+    closed_request_count_3d,
+    closed_request_count_7d,
     round(backlog_component, 2) as backlog_component,
     round(aging_component, 2) as aging_component,
     round(repeat_component, 2) as repeat_component,

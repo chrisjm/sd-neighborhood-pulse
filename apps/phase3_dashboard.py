@@ -104,6 +104,62 @@ def load_service_daily_data() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300)
+def load_neighborhood_daily_metrics() -> pd.DataFrame:
+    with duckdb.connect(str(DB_PATH), read_only=True) as conn:
+        try:
+            return conn.execute(
+                """
+                select *
+                from main.fct_neighborhood_daily_metrics
+                """
+            ).fetchdf()
+        except duckdb.Error:
+            return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def load_city_daily_metrics() -> pd.DataFrame:
+    with duckdb.connect(str(DB_PATH), read_only=True) as conn:
+        try:
+            return conn.execute(
+                """
+                select *
+                from main.fct_city_daily_metrics
+                """
+            ).fetchdf()
+        except duckdb.Error:
+            return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def load_neighborhood_service_daily_metrics() -> pd.DataFrame:
+    with duckdb.connect(str(DB_PATH), read_only=True) as conn:
+        try:
+            return conn.execute(
+                """
+                select *
+                from main.fct_neighborhood_service_daily_metrics
+                """
+            ).fetchdf()
+        except duckdb.Error:
+            return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
+def load_city_service_daily_metrics() -> pd.DataFrame:
+    with duckdb.connect(str(DB_PATH), read_only=True) as conn:
+        try:
+            return conn.execute(
+                """
+                select *
+                from main.fct_city_service_daily_metrics
+                """
+            ).fetchdf()
+        except duckdb.Error:
+            return pd.DataFrame()
+
+
+@st.cache_data(ttl=300)
 def load_hotspots_data() -> pd.DataFrame:
     with duckdb.connect(str(DB_PATH), read_only=True) as conn:
         return conn.execute(
@@ -470,6 +526,59 @@ def normalize_zipcode_columns(df: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
+def summarize_busy_light_services(service_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if service_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    busy = service_df[service_df["is_busy_day"]].sort_values("request_count", ascending=False)
+    light = service_df[service_df["is_light_day"]].sort_values("request_count", ascending=False)
+    return busy, light
+
+
+def resolve_latest_metric_date(preferred: pd.Timestamp, df: pd.DataFrame) -> pd.Timestamp | None:
+    if df.empty or "metric_date" not in df.columns:
+        return None
+
+    metric_dates = pd.to_datetime(df["metric_date"]).dropna()
+    if metric_dates.empty:
+        return None
+
+    if preferred in metric_dates.values:
+        return preferred
+
+    return metric_dates.max()
+
+
+def resolve_latest_slice_date(
+    df: pd.DataFrame,
+    grain_type: str,
+    grain_value: str,
+    preferred: pd.Timestamp,
+) -> pd.Timestamp | None:
+    if df.empty:
+        return None
+
+    slice_df = df[
+        (df.get("grain_type") == grain_type)
+        & (df.get("grain_value").astype(str) == str(grain_value))
+    ]
+    if slice_df.empty:
+        return None
+
+    return resolve_latest_metric_date(preferred, slice_df)
+
+
+def read_metric_value(row_df: pd.DataFrame, column: str) -> float | None:
+    if row_df.empty or column not in row_df.columns:
+        return None
+
+    value = row_df.iloc[0][column]
+    if pd.isna(value):
+        return None
+
+    return float(value)
+
+
 st.set_page_config(page_title="SD Neighborhood Pulse", layout="wide")
 st.title("San Diego Neighborhood Pulse")
 st.caption("Neighborhood service frustration and hotspot monitoring")
@@ -481,13 +590,27 @@ if not DB_PATH.exists():
 frustration = load_frustration_data()
 hotspots = load_hotspots_data()
 service_daily = load_service_daily_data()
+neighborhood_daily_metrics = load_neighborhood_daily_metrics()
+city_daily_metrics = load_city_daily_metrics()
+neighborhood_service_daily = load_neighborhood_service_daily_metrics()
+city_service_daily = load_city_service_daily_metrics()
 frustration = normalize_zipcode_columns(frustration)
 hotspots = normalize_zipcode_columns(hotspots)
 service_daily = normalize_zipcode_columns(service_daily)
+neighborhood_daily_metrics = normalize_zipcode_columns(neighborhood_daily_metrics)
+neighborhood_service_daily = normalize_zipcode_columns(neighborhood_service_daily)
 
 frustration["as_of_date"] = pd.to_datetime(frustration["as_of_date"])
 if not service_daily.empty:
     service_daily["metric_date"] = pd.to_datetime(service_daily["metric_date"])
+if not neighborhood_daily_metrics.empty:
+    neighborhood_daily_metrics["metric_date"] = pd.to_datetime(neighborhood_daily_metrics["metric_date"])
+if not city_daily_metrics.empty:
+    city_daily_metrics["metric_date"] = pd.to_datetime(city_daily_metrics["metric_date"])
+if not neighborhood_service_daily.empty:
+    neighborhood_service_daily["metric_date"] = pd.to_datetime(neighborhood_service_daily["metric_date"])
+if not city_service_daily.empty:
+    city_service_daily["metric_date"] = pd.to_datetime(city_service_daily["metric_date"])
 
 if frustration.empty:
     st.warning("No frustration index data available yet. Run dbt models first.")
@@ -601,6 +724,44 @@ trend = frustration[
 ].sort_values("as_of_date")
 trend = calculate_simulated_index(trend, weights)
 
+if neighborhood_daily_metrics.empty:
+    focus_daily_slice = pd.DataFrame()
+else:
+    focus_daily_slice = neighborhood_daily_metrics[
+        (neighborhood_daily_metrics.get("grain_type") == grain)
+        & (neighborhood_daily_metrics.get("grain_value").astype(str) == str(selected_value))
+    ].copy()
+focus_daily_date = resolve_latest_slice_date(neighborhood_daily_metrics, grain, selected_value, latest_date)
+if focus_daily_date is not None:
+    focus_daily_row = focus_daily_slice[focus_daily_slice["metric_date"] == focus_daily_date]
+else:
+    focus_daily_row = pd.DataFrame()
+
+city_daily_date = resolve_latest_metric_date(latest_date, city_daily_metrics)
+if city_daily_date is not None:
+    city_daily_row = city_daily_metrics[city_daily_metrics["metric_date"] == city_daily_date]
+else:
+    city_daily_row = pd.DataFrame()
+
+if neighborhood_service_daily.empty:
+    focus_service_slice = pd.DataFrame()
+else:
+    focus_service_slice = neighborhood_service_daily[
+        (neighborhood_service_daily.get("grain_type") == grain)
+        & (neighborhood_service_daily.get("grain_value").astype(str) == str(selected_value))
+    ].copy()
+focus_service_date = resolve_latest_metric_date(latest_date, focus_service_slice)
+if focus_service_date is not None:
+    focus_service_latest = focus_service_slice[focus_service_slice["metric_date"] == focus_service_date]
+else:
+    focus_service_latest = pd.DataFrame()
+
+city_service_date = resolve_latest_metric_date(latest_date, city_service_daily)
+if city_service_date is not None:
+    city_service_latest = city_service_daily[city_service_daily["metric_date"] == city_service_date]
+else:
+    city_service_latest = pd.DataFrame()
+
 if trend.empty:
     st.info("No trend points available for the selected area.")
     st.stop()
@@ -643,6 +804,51 @@ with focused_tab:
         "Requests",
         f"{int(latest_requests)}",
         delta=(f"{request_delta_vs_prior_week:+.1f} vs prior 7d avg" if request_delta_vs_prior_week is not None else None),
+    )
+    recency_focus_open_3d = read_metric_value(focus_daily_row, "opened_request_count_3d")
+    recency_focus_open_7d = read_metric_value(focus_daily_row, "opened_request_count_7d")
+    recency_focus_closed_3d = read_metric_value(focus_daily_row, "closed_request_count_3d")
+    recency_focus_closed_7d = read_metric_value(focus_daily_row, "closed_request_count_7d")
+    recency_city_open_3d = read_metric_value(city_daily_row, "opened_request_count_3d")
+    recency_city_open_7d = read_metric_value(city_daily_row, "opened_request_count_7d")
+    recency_city_closed_3d = read_metric_value(city_daily_row, "closed_request_count_3d")
+    recency_city_closed_7d = read_metric_value(city_daily_row, "closed_request_count_7d")
+    recency_cols = st.columns(4)
+    recency_cols[0].metric(
+        "Opened (3d)",
+        f"{int(recency_focus_open_3d)}" if recency_focus_open_3d is not None else "n/a",
+        delta=(
+            f"city {int(recency_city_open_3d)}"
+            if recency_city_open_3d is not None and recency_focus_open_3d is not None
+            else None
+        ),
+    )
+    recency_cols[1].metric(
+        "Opened (7d)",
+        f"{int(recency_focus_open_7d)}" if recency_focus_open_7d is not None else "n/a",
+        delta=(
+            f"city {int(recency_city_open_7d)}"
+            if recency_city_open_7d is not None and recency_focus_open_7d is not None
+            else None
+        ),
+    )
+    recency_cols[2].metric(
+        "Closed (3d)",
+        f"{int(recency_focus_closed_3d)}" if recency_focus_closed_3d is not None else "n/a",
+        delta=(
+            f"city {int(recency_city_closed_3d)}"
+            if recency_city_closed_3d is not None and recency_focus_closed_3d is not None
+            else None
+        ),
+    )
+    recency_cols[3].metric(
+        "Closed (7d)",
+        f"{int(recency_focus_closed_7d)}" if recency_focus_closed_7d is not None else "n/a",
+        delta=(
+            f"city {int(recency_city_closed_7d)}"
+            if recency_city_closed_7d is not None and recency_focus_closed_7d is not None
+            else None
+        ),
     )
     if delta_vs_prior_week is None:
         st.caption("Not enough history yet for a complete prior 7-day baseline.")
@@ -774,6 +980,35 @@ with focused_tab:
     )
     fig_trend.update_layout(yaxis_title="Score (0-100)", xaxis_title="As of date", legend_title_text="Series")
     st.plotly_chart(fig_trend, width="stretch")
+
+    st.subheader("Operational pulse (busy/light services)")
+    focus_busy, focus_light = summarize_busy_light_services(focus_service_latest)
+    if focus_service_latest.empty:
+        st.info("Busy/light service signals unavailable for this selection yet.")
+    else:
+        pulse_cols = st.columns(2)
+        with pulse_cols[0]:
+            st.caption("Busy services today (top 8)")
+            if focus_busy.empty:
+                st.write("No busy services flagged.")
+            else:
+                st.dataframe(
+                    focus_busy.head(8)[["service_name", "request_count"]]
+                    .rename(columns={"service_name": "Service", "request_count": "Requests"}),
+                    width="stretch",
+                    hide_index=True,
+                )
+        with pulse_cols[1]:
+            st.caption("Light services today (top 8)")
+            if focus_light.empty:
+                st.write("No light services flagged.")
+            else:
+                st.dataframe(
+                    focus_light.head(8)[["service_name", "request_count"]]
+                    .rename(columns={"service_name": "Service", "request_count": "Requests"}),
+                    width="stretch",
+                    hide_index=True,
+                )
 
 with global_tab:
     st.caption(
@@ -961,6 +1196,35 @@ with global_tab:
             )
             fig_points.update_layout(margin={"r": 0, "t": 50, "l": 0, "b": 0})
             st.plotly_chart(fig_points, width="stretch")
+
+    st.subheader("Citywide operational pulse")
+    city_busy, city_light = summarize_busy_light_services(city_service_latest)
+    if city_service_latest.empty:
+        st.info("Citywide busy/light service signals unavailable yet.")
+    else:
+        pulse_cols = st.columns(2)
+        with pulse_cols[0]:
+            st.caption("Busy services citywide (top 10)")
+            if city_busy.empty:
+                st.write("No busy services flagged citywide.")
+            else:
+                st.dataframe(
+                    city_busy.head(10)[["service_name", "request_count"]]
+                    .rename(columns={"service_name": "Service", "request_count": "Requests"}),
+                    width="stretch",
+                    hide_index=True,
+                )
+        with pulse_cols[1]:
+            st.caption("Light services citywide (top 10)")
+            if city_light.empty:
+                st.write("No light services flagged citywide.")
+            else:
+                st.dataframe(
+                    city_light.head(10)[["service_name", "request_count"]]
+                    .rename(columns={"service_name": "Service", "request_count": "Requests"}),
+                    width="stretch",
+                    hide_index=True,
+                )
 
 st.info(
     "Manual refresh: run ingest + dbt run/test/snapshot from README before checking this dashboard. "

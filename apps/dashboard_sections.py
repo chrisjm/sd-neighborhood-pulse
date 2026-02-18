@@ -5,9 +5,19 @@ import plotly.express as px
 import streamlit as st
 
 from apps.dashboard_helpers import (
+    ALT_BOUNDARY_DIR,
     BASELINE_LABELS,
+    BOUNDARY_DIR,
     COMPONENT_COLUMNS,
     COMPONENT_LABELS,
+    GRAIN_LABELS,
+    build_geojson_join_lookup,
+    build_intervention_priority_table,
+    detect_join_key,
+    filter_geojson_for_grain,
+    geojson_property_is_numeric,
+    load_boundary_geojson,
+    normalize_join_value,
     summarize_busy_light_services,
 )
 
@@ -258,6 +268,207 @@ def render_focused_tab(
             else:
                 st.dataframe(
                     focus_light.head(8)[["service_name", "request_count"]]
+                    .rename(columns={"service_name": "Service", "request_count": "Requests"}),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+
+def render_global_tab(
+    latest_date_display: str,
+    current_slice: pd.DataFrame,
+    top_n: int,
+    grain: str,
+    window: int,
+    include_reserve: bool,
+    component_window: int,
+    hotspots: pd.DataFrame,
+    service_daily: pd.DataFrame,
+    baseline_mode: str,
+    city_service_latest: pd.DataFrame,
+) -> None:
+    st.caption(
+        f"As of {latest_date_display} | Areas in cut: {len(current_slice)} | "
+        f"Highest area now: {str(current_slice.iloc[0]['grain_value'])}"
+    )
+
+    st.subheader(f"Current Request Volume ({GRAIN_LABELS[grain]}, {window}-day)")
+    if grain == "comm_plan_name":
+        reserve_note = "included" if include_reserve else "excluded"
+        st.caption(f"Reserve area is {reserve_note} in this community plan view.")
+    top_ranked = (
+        current_slice.sort_values("request_count", ascending=False)
+        .head(top_n)
+        .sort_values("request_count", ascending=True)
+    )
+    top_ranked = top_ranked.copy()
+    top_ranked["grain_value_display"] = top_ranked["grain_value"].astype(str)
+
+    fig_bar = px.bar(
+        top_ranked,
+        x="request_count",
+        y="grain_value_display",
+        orientation="h",
+        color="request_count",
+        color_continuous_scale="Reds",
+        title=f"Top {top_n} areas by request volume",
+        labels={
+            "request_count": "Requests",
+            "grain_value_display": GRAIN_LABELS[grain],
+        },
+    )
+    chart_height = min(1400, max(560, int(len(top_ranked) * 28)))
+    fig_bar.update_layout(height=chart_height, coloraxis_showscale=False)
+    fig_bar.update_yaxes(type="category")
+    st.plotly_chart(fig_bar, width="stretch")
+
+    with st.expander("How to read the components", expanded=False):
+        st.markdown(
+            "- **Request volume** highlights where demand is highest for the selected window.\n"
+            "- Components (backlog, aging, repeat, resolution) describe *why* pressure is elevated.\n"
+            "- Use the focused tab to see how component shifts relate to recent demand swings."
+        )
+
+    st.subheader("Where to intervene first")
+    hotspot_slice = hotspots[hotspots["window_days"] == component_window].copy()
+    hotspot_slice["grain_value"] = hotspot_slice[grain].fillna("Unknown")
+    hotspot_slice = hotspot_slice[hotspot_slice["grain_value"] != "Unknown"]
+    intervention_table = build_intervention_priority_table(
+        current_slice=current_slice,
+        service_daily=service_daily,
+        hotspot_slice=hotspot_slice,
+        grain_type=grain,
+        latest_date=pd.to_datetime(latest_date_display),
+        current_window_days=window,
+        baseline_mode=baseline_mode,
+        max_rows=min(top_n, 12),
+    )
+    if intervention_table.empty:
+        st.info("Intervention table unavailable for this cut.")
+    else:
+        st.dataframe(intervention_table, width="stretch", hide_index=True)
+
+    st.subheader("Hotspots")
+    geojson, geojson_path = load_boundary_geojson(grain)
+    boundary_join_key = None
+    if geojson is not None:
+        geojson = filter_geojson_for_grain(geojson, grain)
+        boundary_join_key = detect_join_key(geojson, set(current_slice["grain_value"].astype(str)), grain)
+
+    if geojson is not None and boundary_join_key is not None:
+        choropleth_data = current_slice[["grain_value", "request_count"]].copy()
+        if "grain_geo_value" in current_slice.columns:
+            choropleth_data["grain_geo_value"] = current_slice["grain_geo_value"].values
+        location_column = "grain_value"
+
+        if grain == "comm_plan_name":
+            if "grain_geo_value" in choropleth_data.columns:
+                choropleth_data["join_location"] = choropleth_data["grain_geo_value"].fillna(
+                    choropleth_data["grain_value"]
+                )
+            else:
+                comm_plan_lookup = build_geojson_join_lookup(geojson, boundary_join_key, grain)
+                choropleth_data["join_location"] = choropleth_data["grain_value"].apply(
+                    lambda value: comm_plan_lookup.get(normalize_join_value(value, grain))
+                )
+            choropleth_data = choropleth_data[choropleth_data["join_location"].notna()].copy()
+            location_column = "join_location"
+
+        if grain == "council_district":
+            district_digits = choropleth_data["grain_value"].astype(str).str.extract(r"(\d{1,2})")[0]
+            if geojson_property_is_numeric(geojson, boundary_join_key):
+                choropleth_data["join_location"] = pd.to_numeric(district_digits, errors="coerce")
+            else:
+                choropleth_data["join_location"] = district_digits
+            choropleth_data = choropleth_data[choropleth_data["join_location"].notna()].copy()
+            location_column = "join_location"
+
+        fig_choropleth = px.choropleth_map(
+            choropleth_data,
+            geojson=geojson,
+            locations=location_column,
+            featureidkey=f"properties.{boundary_join_key}",
+            color="request_count",
+            color_continuous_scale="Reds",
+            map_style="carto-positron",
+            zoom=9.5,
+            center={"lat": 32.7157, "lon": -117.1611},
+            opacity=0.7,
+            labels={"request_count": "Requests"},
+            title=f"Choropleth by {GRAIN_LABELS[grain]} (latest {window}-day requests)",
+        )
+        fig_choropleth.update_layout(margin={"r": 0, "t": 50, "l": 0, "b": 0})
+        st.plotly_chart(fig_choropleth, width="stretch")
+        st.caption(f"Using boundaries: {geojson_path} (join key: {boundary_join_key})")
+    else:
+        if grain == "comm_plan_name":
+            st.info("No community-plan GeoJSON configured yet. Showing hotspot centroid map for now.")
+        elif geojson is None:
+            st.info(
+                f"Choropleth unavailable for {GRAIN_LABELS[grain]}: no boundary GeoJSON found in {ALT_BOUNDARY_DIR} or {BOUNDARY_DIR}. "
+                "Showing centroid bubble map instead."
+            )
+        else:
+            st.info(
+                f"Choropleth unavailable for {GRAIN_LABELS[grain]}: boundary file found but no matching join key. "
+                "Showing centroid bubble map instead."
+            )
+
+        map_points = hotspot_slice.sort_values("request_count", ascending=False).head(800)
+        if map_points.empty:
+            st.warning("No hotspot points available for this filter.")
+        else:
+            fig_points = px.scatter_map(
+                map_points,
+                lat="centroid_latitude",
+                lon="centroid_longitude",
+                size="request_count",
+                color="open_ratio_pct",
+                color_continuous_scale="OrRd",
+                hover_name="grain_value",
+                hover_data={
+                    "request_count": True,
+                    "open_ratio_pct": ":.2f",
+                    "dominant_service_name": True,
+                    "comm_plan_name": True,
+                    "council_district": True,
+                    "zipcode": True,
+                    "centroid_latitude": False,
+                    "centroid_longitude": False,
+                    "grain_value": False,
+                },
+                zoom=10,
+                center={"lat": 32.7157, "lon": -117.1611},
+                map_style="open-street-map",
+                title=f"Hotspot centroids by {GRAIN_LABELS[grain]} ({window}-day)",
+            )
+            fig_points.update_layout(margin={"r": 0, "t": 50, "l": 0, "b": 0})
+            st.plotly_chart(fig_points, width="stretch")
+
+    st.subheader("Citywide operational pulse")
+    city_busy, city_light = summarize_busy_light_services(city_service_latest)
+    if city_service_latest.empty:
+        st.info("Citywide busy/light service signals unavailable yet.")
+    else:
+        pulse_cols = st.columns(2)
+        with pulse_cols[0]:
+            st.caption("Busy services citywide (top 10)")
+            if city_busy.empty:
+                st.write("No busy services flagged citywide.")
+            else:
+                st.dataframe(
+                    city_busy.head(10)[["service_name", "request_count"]]
+                    .rename(columns={"service_name": "Service", "request_count": "Requests"}),
+                    width="stretch",
+                    hide_index=True,
+                )
+        with pulse_cols[1]:
+            st.caption("Light services citywide (top 10)")
+            if city_light.empty:
+                st.write("No light services flagged citywide.")
+            else:
+                st.dataframe(
+                    city_light.head(10)[["service_name", "request_count"]]
                     .rename(columns={"service_name": "Service", "request_count": "Requests"}),
                     width="stretch",
                     hide_index=True,

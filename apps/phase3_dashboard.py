@@ -42,33 +42,6 @@ BASELINE_LABELS = {
     "prior_90": "Prior 90 Days",
     "yoy": "Year over Year",
 }
-# CHANGE ME: Candidate policy presets for weights. Keep visible/easy to hard-code after policy alignment.
-WEIGHT_PRESETS = {
-    "Balanced (v1)": {
-        "backlog_component": 25,
-        "aging_component": 25,
-        "repeat_component": 25,
-        "resolution_component": 25,
-    },
-    "Resident Experience": {
-        "backlog_component": 35,
-        "aging_component": 40,
-        "repeat_component": 15,
-        "resolution_component": 10,
-    },
-    "Operational Efficiency": {
-        "backlog_component": 20,
-        "aging_component": 15,
-        "repeat_component": 30,
-        "resolution_component": 35,
-    },
-    "Equity Watch": {
-        "backlog_component": 20,
-        "aging_component": 45,
-        "repeat_component": 25,
-        "resolution_component": 10,
-    },
-}
 
 
 @st.cache_data(ttl=300)
@@ -190,24 +163,6 @@ def prior_week_average(trend_df: pd.DataFrame, value_column: str, latest: pd.Tim
     return float(prior_week[value_column].mean())
 
 
-def normalize_weights(raw_weights: dict[str, float]) -> dict[str, float]:
-    total = sum(raw_weights.values())
-    if total <= 0:
-        equal_weight = 1.0 / len(COMPONENT_COLUMNS)
-        return {column: equal_weight for column in COMPONENT_COLUMNS}
-    return {column: raw_weights.get(column, 0.0) / total for column in COMPONENT_COLUMNS}
-
-
-def calculate_simulated_index(df: pd.DataFrame, weights: dict[str, float]) -> pd.DataFrame:
-    if df.empty:
-        return df
-
-    scored = df.copy()
-    weighted_sum = sum(scored[column].astype(float) * weights.get(column, 0.0) for column in COMPONENT_COLUMNS)
-    scored["simulated_frustration_index"] = weighted_sum.round(2)
-    return scored
-
-
 def baseline_period_bounds(
     latest_date: pd.Timestamp, current_window_days: int, baseline_mode: str
 ) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp, pd.Timestamp]:
@@ -317,7 +272,7 @@ def build_intervention_priority_table(
         return pd.DataFrame()
 
     # Keep business-facing table compact and stable for policy review.
-    focus_areas = current_slice.sort_values("simulated_frustration_index", ascending=False).head(max_rows)
+    focus_areas = current_slice.sort_values("request_count", ascending=False).head(max_rows)
     hotspot_summary = pd.DataFrame()
     if not hotspot_slice.empty:
         hotspot_summary = (
@@ -351,10 +306,13 @@ def build_intervention_priority_table(
             trend_pct = top_service["pct_change"]
             suggested_action = str(top_service["recommended_action"])
 
+        aging_value = area_row.get("aging_component", 0.0)
+        if pd.isna(aging_value):
+            aging_value = 0.0
         row = {
             "Area": area_name,
-            "Simulated Index": round(float(area_row["simulated_frustration_index"]), 2),
-            "Aging Burden": round(float(area_row["aging_component"]), 2),
+            "Requests": round(float(area_row["request_count"]), 0),
+            "Aging Burden": round(float(aging_value), 2),
             "Dominant Service": service_name,
             "Trend %": trend_pct,
             "Open Ratio %": None,
@@ -526,6 +484,99 @@ def normalize_zipcode_columns(df: pd.DataFrame) -> pd.DataFrame:
     return normalized
 
 
+def build_window_request_rollup(
+    daily_df: pd.DataFrame, grain_type: str, latest_date: pd.Timestamp | None, window_days: int
+) -> pd.DataFrame:
+    if daily_df.empty:
+        return pd.DataFrame()
+
+    slice_df = daily_df[daily_df.get("grain_type") == grain_type].copy()
+    if slice_df.empty:
+        return pd.DataFrame()
+
+    slice_df["metric_date"] = pd.to_datetime(slice_df["metric_date"])
+    resolved_latest = latest_date or slice_df["metric_date"].max()
+    if pd.isna(resolved_latest):
+        return pd.DataFrame()
+
+    window_start = resolved_latest - pd.Timedelta(days=window_days - 1)
+    window_mask = (slice_df["metric_date"] >= window_start) & (slice_df["metric_date"] <= resolved_latest)
+    rollup = (
+        slice_df.loc[window_mask]
+        .groupby("grain_value", as_index=False)["request_count"]
+        .sum()
+        .assign(
+            as_of_date=resolved_latest,
+            window_days=window_days,
+            grain_type=grain_type,
+        )
+    )
+    for column in COMPONENT_COLUMNS:
+        rollup[column] = pd.NA
+    return rollup
+
+
+def window_unknown_rate(
+    daily_df: pd.DataFrame,
+    grain_type: str,
+    latest_date: pd.Timestamp | None,
+    window_days: int,
+) -> float | None:
+    if daily_df.empty:
+        return None
+
+    slice_df = daily_df[daily_df.get("grain_type") == grain_type].copy()
+    if slice_df.empty:
+        return None
+
+    slice_df["metric_date"] = pd.to_datetime(slice_df["metric_date"])
+    resolved_latest = latest_date or slice_df["metric_date"].max()
+    if pd.isna(resolved_latest):
+        return None
+
+    window_start = resolved_latest - pd.Timedelta(days=window_days - 1)
+    window_mask = (slice_df["metric_date"] >= window_start) & (slice_df["metric_date"] <= resolved_latest)
+    window_slice = slice_df.loc[window_mask]
+    if window_slice.empty:
+        return None
+
+    total = window_slice["request_count"].sum()
+    if total == 0:
+        return 0.0
+    unknown_total = window_slice.loc[window_slice["grain_value"] == "Unknown", "request_count"].sum()
+    return float((unknown_total / total) * 100)
+
+
+def window_total_for_area(
+    daily_df: pd.DataFrame,
+    grain_type: str,
+    grain_value: str,
+    latest_date: pd.Timestamp | None,
+    window_days: int,
+    offset_days: int = 0,
+) -> float | None:
+    if daily_df.empty:
+        return None
+
+    slice_df = daily_df[
+        (daily_df.get("grain_type") == grain_type)
+        & (daily_df.get("grain_value").astype(str) == str(grain_value))
+    ].copy()
+    if slice_df.empty:
+        return None
+
+    slice_df["metric_date"] = pd.to_datetime(slice_df["metric_date"])
+    resolved_latest = latest_date or slice_df["metric_date"].max()
+    if pd.isna(resolved_latest):
+        return None
+
+    window_end = resolved_latest - pd.Timedelta(days=offset_days)
+    window_start = window_end - pd.Timedelta(days=window_days - 1)
+    window_mask = (slice_df["metric_date"] >= window_start) & (slice_df["metric_date"] <= window_end)
+    total = slice_df.loc[window_mask, "request_count"].sum()
+    return float(total)
+
+
 def summarize_busy_light_services(service_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     if service_df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -581,7 +632,7 @@ def read_metric_value(row_df: pd.DataFrame, column: str) -> float | None:
 
 st.set_page_config(page_title="SD Neighborhood Pulse", layout="wide")
 st.title("San Diego Neighborhood Pulse")
-st.caption("Neighborhood service frustration and hotspot monitoring")
+st.caption("Weekly briefing on neighborhood service pressure and demand patterns")
 
 if not DB_PATH.exists():
     st.error("DuckDB file not found. Run the manual refresh workflow first.")
@@ -613,13 +664,13 @@ if not city_service_daily.empty:
     city_service_daily["metric_date"] = pd.to_datetime(city_service_daily["metric_date"])
 
 if frustration.empty:
-    st.warning("No frustration index data available yet. Run dbt models first.")
+    st.warning("No neighborhood pressure data available yet. Run dbt models first.")
     st.stop()
 
 latest_date = frustration["as_of_date"].max()
 latest_date_display = pd.to_datetime(latest_date).date().isoformat()
 st.sidebar.header("Filters")
-window = st.sidebar.selectbox("Window (days)", [30, 90], index=0)
+window = st.sidebar.selectbox("Window (days)", [7, 30, 90], index=0)
 grain = st.sidebar.selectbox("Neighborhood grain", ["comm_plan_name", "council_district", "zipcode"], index=0)
 baseline_mode = st.sidebar.selectbox(
     "Comparison baseline",
@@ -636,45 +687,17 @@ if grain == "comm_plan_name":
     else:
         st.sidebar.caption("Reserve is excluded by default. Enable the checkbox to include it.")
 
-st.sidebar.markdown("---")
-st.sidebar.subheader("Policy Tuning Lab")
-# CHANGE ME: Keep presets + active slider weights visible so policy can hard-code final values later.
-preset_name = st.sidebar.selectbox("Weight preset", options=list(WEIGHT_PRESETS.keys()), index=0)
-if "weight_initialized" not in st.session_state:
-    for component, value in WEIGHT_PRESETS["Balanced (v1)"].items():
-        st.session_state[f"weight_{component}"] = int(value)
-    st.session_state["weight_initialized"] = True
-
-if st.sidebar.button("Apply preset", width="stretch"):
-    for component, value in WEIGHT_PRESETS[preset_name].items():
-        st.session_state[f"weight_{component}"] = int(value)
-
-with st.sidebar.expander("Tune component weights", expanded=False):
-    raw_weights = {}
-    for component in COMPONENT_COLUMNS:
-        raw_weights[component] = float(
-            st.slider(
-                COMPONENT_LABELS[component],
-                min_value=0,
-                max_value=100,
-                step=1,
-                key=f"weight_{component}",
-            )
-        )
-
-weights = normalize_weights(raw_weights)
-weight_caption = " | ".join(
-    f"{COMPONENT_LABELS[column]}: {weights[column] * 100:.1f}%" for column in COMPONENT_COLUMNS
-)
-st.sidebar.caption(f"Normalized active weights -> {weight_caption}")
-ranking_column = "simulated_frustration_index"
-
-current_slice_all = frustration[
-    (frustration["window_days"] == window)
-    & (frustration["grain_type"] == grain)
-    & (frustration["as_of_date"] == latest_date)
-]
-current_slice_all = calculate_simulated_index(current_slice_all, weights).sort_values(ranking_column, ascending=False)
+component_window = 30 if window == 7 else window
+latest_daily_date = resolve_latest_metric_date(latest_date, neighborhood_daily_metrics)
+if window == 7:
+    current_slice_all = build_window_request_rollup(neighborhood_daily_metrics, grain, latest_daily_date, window)
+else:
+    current_slice_all = frustration[
+        (frustration["window_days"] == window)
+        & (frustration["grain_type"] == grain)
+        & (frustration["as_of_date"] == latest_date)
+    ]
+current_slice_all = current_slice_all.sort_values("request_count", ascending=False)
 current_slice = current_slice_all[current_slice_all["grain_value"] != "Unknown"]
 if grain == "comm_plan_name" and not include_reserve:
     current_slice = current_slice[~current_slice["grain_value"].apply(is_reserve_comm_plan)]
@@ -686,10 +709,13 @@ if current_slice_all.empty:
     )
     st.stop()
 
-current_unknown_rate = unknown_rate(current_slice_all, "grain_value")
-if current_unknown_rate > 0:
+if window == 7:
+    current_unknown_rate = window_unknown_rate(neighborhood_daily_metrics, grain, latest_daily_date, window)
+else:
+    current_unknown_rate = unknown_rate(current_slice_all, "grain_value")
+if current_unknown_rate is not None and current_unknown_rate > 0:
     st.warning(
-        f"Data quality note: {current_unknown_rate:.1f}% of {GRAIN_LABELS[grain]} rows are mapped to Unknown in this current cut."
+        f"Data quality note: {current_unknown_rate:.1f}% of {GRAIN_LABELS[grain]} requests are mapped to Unknown in this cut."
     )
 
 if current_slice.empty:
@@ -717,12 +743,25 @@ selected_value = st.sidebar.selectbox(
 )
 
 selected_latest = current_slice[current_slice["grain_value"] == selected_value].iloc[0]
-trend = frustration[
-    (frustration["window_days"] == window)
+component_slice_latest = frustration[
+    (frustration["window_days"] == component_window)
+    & (frustration["grain_type"] == grain)
+    & (frustration["as_of_date"] == latest_date)
+]
+component_slice_latest = component_slice_latest[component_slice_latest["grain_value"] != "Unknown"]
+if grain == "comm_plan_name" and not include_reserve:
+    component_slice_latest = component_slice_latest[
+        ~component_slice_latest["grain_value"].apply(is_reserve_comm_plan)
+    ]
+selected_component_latest = component_slice_latest[
+    component_slice_latest["grain_value"].astype(str) == str(selected_value)
+]
+
+component_trend = frustration[
+    (frustration["window_days"] == component_window)
     & (frustration["grain_type"] == grain)
     & (frustration["grain_value"] == selected_value)
 ].sort_values("as_of_date")
-trend = calculate_simulated_index(trend, weights)
 
 if neighborhood_daily_metrics.empty:
     focus_daily_slice = pd.DataFrame()
@@ -762,27 +801,56 @@ if city_service_date is not None:
 else:
     city_service_latest = pd.DataFrame()
 
-if trend.empty:
-    st.info("No trend points available for the selected area.")
+if component_trend.empty:
+    st.info("No component trend points available for the selected area.")
     st.stop()
 
-city_slice = frustration[
-    (frustration["window_days"] == window)
-    & (frustration["grain_type"] == grain)
-    & (frustration["grain_value"] != "Unknown")
-]
-if grain == "comm_plan_name" and not include_reserve:
-    city_slice = city_slice[~city_slice["grain_value"].apply(is_reserve_comm_plan)]
-city_slice = calculate_simulated_index(city_slice, weights)
-city_median_latest = float(current_slice[ranking_column].median())
-latest_index = float(selected_latest[ranking_column])
 latest_requests = float(selected_latest["request_count"])
-prior_week_index_avg = prior_week_average(trend, ranking_column, latest_date)
-prior_week_request_avg = prior_week_average(trend, "request_count", latest_date)
-delta_vs_prior_week = latest_index - prior_week_index_avg if prior_week_index_avg is not None else None
-request_delta_vs_prior_week = latest_requests - prior_week_request_avg if prior_week_request_avg is not None else None
-delta_vs_city_median = latest_index - city_median_latest
-top_driver = driver_label(selected_latest)
+if window == 7:
+    prior_window_request_avg = window_total_for_area(
+        neighborhood_daily_metrics,
+        grain,
+        selected_value,
+        latest_daily_date,
+        window_days=7,
+        offset_days=7,
+    )
+else:
+    prior_window_request_avg = prior_week_average(component_trend, "request_count", latest_date)
+request_delta_vs_prior_window = (
+    latest_requests - prior_window_request_avg if prior_window_request_avg is not None else None
+)
+
+if selected_component_latest.empty:
+    selected_component_latest = pd.DataFrame([{}])
+top_driver = (
+    driver_label(selected_component_latest.iloc[0])
+    if not selected_component_latest.empty and not selected_component_latest.isna().all(axis=None)
+    else "Unavailable"
+)
+
+st.subheader("Citywide context")
+citywide_daily = neighborhood_daily_metrics[
+    (neighborhood_daily_metrics.get("grain_type") == grain)
+    & (neighborhood_daily_metrics.get("grain_value") != "Unknown")
+].copy()
+if not citywide_daily.empty:
+    citywide_daily = citywide_daily.sort_values("metric_date")
+    citywide_summary = (
+        citywide_daily.groupby("metric_date", as_index=False)["request_count"].sum().rename(columns={"request_count": "requests"})
+    )
+    citywide_summary = citywide_summary.tail(365)
+    fig_city = px.line(
+        citywide_summary,
+        x="metric_date",
+        y="requests",
+        title=f"Citywide request volume trend ({GRAIN_LABELS[grain]})",
+        labels={"metric_date": "Date", "requests": "Total requests"},
+    )
+    fig_city.update_layout(yaxis_title="Requests")
+    st.plotly_chart(fig_city, width="stretch")
+else:
+    st.info("Citywide trend unavailable for this grain.")
 
 focused_tab, global_tab = st.tabs(["Focused Area", "Global Landscape"])
 
@@ -790,20 +858,22 @@ with focused_tab:
     st.subheader("What changed this week")
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("Selected area", selected_value)
+    repeat_value = read_metric_value(selected_component_latest, "repeat_component")
+    resolution_value = read_metric_value(selected_component_latest, "resolution_component")
     kpi2.metric(
-        "Frustration index",
-        f"{latest_index:.2f}",
-        delta=(f"{delta_vs_prior_week:+.2f} vs prior 7d avg" if delta_vs_prior_week is not None else None),
+        f"Repeat pressure ({component_window}d)",
+        f"{repeat_value:.2f}" if repeat_value is not None else "n/a",
     )
     kpi3.metric(
-        "Vs city median",
-        f"{delta_vs_city_median:+.2f}",
-        delta=f"city median {city_median_latest:.2f}",
+        f"Resolution lag ({component_window}d)",
+        f"{resolution_value:.2f}" if resolution_value is not None else "n/a",
     )
     kpi4.metric(
         "Requests",
         f"{int(latest_requests)}",
-        delta=(f"{request_delta_vs_prior_week:+.1f} vs prior 7d avg" if request_delta_vs_prior_week is not None else None),
+        delta=(
+            f"{request_delta_vs_prior_window:+.1f} vs prior window" if request_delta_vs_prior_window is not None else None
+        ),
     )
     recency_focus_open_3d = read_metric_value(focus_daily_row, "opened_request_count_3d")
     recency_focus_open_7d = read_metric_value(focus_daily_row, "opened_request_count_7d")
@@ -850,23 +920,26 @@ with focused_tab:
             else None
         ),
     )
-    if delta_vs_prior_week is None:
-        st.caption("Not enough history yet for a complete prior 7-day baseline.")
+    if request_delta_vs_prior_window is None:
+        st.caption("Not enough history yet for a complete prior window baseline.")
 
     st.subheader("Headline insight")
-    city_direction = "above" if delta_vs_city_median >= 0 else "below"
-    if delta_vs_prior_week is None:
+    if request_delta_vs_prior_window is None:
         weekly_direction_text = "with limited week-over-week history"
     else:
-        weekly_direction_text = "increasing week-over-week" if delta_vs_prior_week >= 0 else "decreasing week-over-week"
+        weekly_direction_text = "increasing week-over-week" if request_delta_vs_prior_window >= 0 else "decreasing week-over-week"
     st.markdown(
-        f"**{selected_value} is {abs(delta_vs_city_median):.2f} points {city_direction} the city median, "
+        f"**{selected_value} recorded {int(latest_requests)} requests in the last {window} days, "
         f"primarily driven by {top_driver}, and is currently {weekly_direction_text}.**"
     )
-    st.caption(
-        f"Latest index: {latest_index:.2f} | City median: {city_median_latest:.2f} | "
-        f"Top component score ({top_driver}): {float(selected_latest[COMPONENT_COLUMNS].max()):.2f}"
-    )
+    if top_driver != "Unavailable":
+        top_component_score = (
+            selected_component_latest[COMPONENT_COLUMNS]
+            .astype(float)
+            .max(axis=1)
+            .iloc[0]
+        )
+        st.caption(f"Top component driver ({top_driver}): {top_component_score:.2f}")
 
     st.subheader("Action brief: what to fix next")
     service_change = build_service_change_table(
@@ -911,36 +984,34 @@ with focused_tab:
         st.dataframe(action_table, width="stretch", hide_index=True)
 
     current_start, current_end, baseline_start, baseline_end = baseline_period_bounds(latest_date, window, baseline_mode)
-    baseline_components = trend[
-        (trend["as_of_date"] >= baseline_start) & (trend["as_of_date"] <= baseline_end)
+    baseline_components = component_trend[
+        (component_trend["as_of_date"] >= baseline_start) & (component_trend["as_of_date"] <= baseline_end)
     ]
     if not baseline_components.empty:
         baseline_component_values = baseline_components[COMPONENT_COLUMNS].mean()
         component_delta = pd.DataFrame(
             {
                 "component": COMPONENT_COLUMNS,
-                "current_score": [float(selected_latest[column]) for column in COMPONENT_COLUMNS],
+                "current_score": [float(selected_component_latest.iloc[0].get(column, 0.0)) for column in COMPONENT_COLUMNS],
                 "baseline_score": [float(baseline_component_values[column]) for column in COMPONENT_COLUMNS],
             }
         )
         component_delta["delta"] = component_delta["current_score"] - component_delta["baseline_score"]
-        component_delta["weighted_delta"] = component_delta["component"].map(weights) * component_delta["delta"]
         component_delta["component_label"] = component_delta["component"].replace(COMPONENT_LABELS)
 
         fig_component_delta = px.bar(
-            component_delta.sort_values("weighted_delta", ascending=False),
-            x="weighted_delta",
+            component_delta.sort_values("delta", ascending=False),
+            x="delta",
             y="component_label",
             orientation="h",
-            color="weighted_delta",
+            color="delta",
             color_continuous_scale="RdYlGn_r",
-            title=f"What moved the score vs {BASELINE_LABELS[baseline_mode]}",
-            labels={"weighted_delta": "Weighted contribution delta", "component_label": "Component"},
+            title=f"Component shifts vs {BASELINE_LABELS[baseline_mode]}",
+            labels={"delta": "Component delta", "component_label": "Component"},
         )
         st.plotly_chart(fig_component_delta, width="stretch")
 
     st.subheader("Trend")
-    show_city_median = st.checkbox("Overlay city median trend", value=True)
     with st.expander("Optional component overlays", expanded=False):
         component_selection = st.multiselect(
             "Select components to overlay",
@@ -950,18 +1021,13 @@ with focused_tab:
         )
 
     trend_frames = [
-        trend[["as_of_date", ranking_column]].rename(columns={ranking_column: "score"}).assign(metric_label="Frustration Index (simulated)")
+        component_trend[["as_of_date", "request_count"]]
+        .rename(columns={"request_count": "score"})
+        .assign(metric_label=f"Requests ({component_window}d)")
     ]
 
-    if show_city_median:
-        city_median_trend = (
-            city_slice.groupby("as_of_date", as_index=False)[ranking_column].median().rename(columns={ranking_column: "score"})
-            .assign(metric_label="City Median")
-        )
-        trend_frames.append(city_median_trend)
-
     if component_selection:
-        component_long = trend[["as_of_date", *component_selection]].melt(
+        component_long = component_trend[["as_of_date", *component_selection]].melt(
             id_vars=["as_of_date"],
             value_vars=component_selection,
             var_name="metric",
@@ -976,9 +1042,9 @@ with focused_tab:
         x="as_of_date",
         y="score",
         color="metric_label",
-        title=f"Frustration trend: {selected_value}",
+        title=f"Request + component trend: {selected_value}",
     )
-    fig_trend.update_layout(yaxis_title="Score (0-100)", xaxis_title="As of date", legend_title_text="Series")
+    fig_trend.update_layout(yaxis_title="Score / Requests", xaxis_title="As of date", legend_title_text="Series")
     st.plotly_chart(fig_trend, width="stretch")
 
     st.subheader("Operational pulse (busy/light services)")
@@ -1016,28 +1082,28 @@ with global_tab:
         f"Highest area now: {str(current_slice.iloc[0]['grain_value'])}"
     )
 
-    st.subheader(f"Current Frustration Index ({GRAIN_LABELS[grain]}, {window}-day)")
+    st.subheader(f"Current Request Volume ({GRAIN_LABELS[grain]}, {window}-day)")
     if grain == "comm_plan_name":
         reserve_note = "included" if include_reserve else "excluded"
         st.caption(f"Reserve area is {reserve_note} in this community plan view.")
     top_ranked = (
-        current_slice.sort_values(ranking_column, ascending=False)
+        current_slice.sort_values("request_count", ascending=False)
         .head(top_n)
-        .sort_values(ranking_column, ascending=True)
+        .sort_values("request_count", ascending=True)
     )
     top_ranked = top_ranked.copy()
     top_ranked["grain_value_display"] = top_ranked["grain_value"].astype(str)
 
     fig_bar = px.bar(
         top_ranked,
-        x=ranking_column,
+        x="request_count",
         y="grain_value_display",
         orientation="h",
-        color=ranking_column,
+        color="request_count",
         color_continuous_scale="Reds",
-        title=f"Top {top_n} areas by simulated frustration index",
+        title=f"Top {top_n} areas by request volume",
         labels={
-            ranking_column: "Frustration Index (0-100)",
+            "request_count": "Requests",
             "grain_value_display": GRAIN_LABELS[grain],
         },
     )
@@ -1046,45 +1112,15 @@ with global_tab:
     fig_bar.update_yaxes(type="category")
     st.plotly_chart(fig_bar, width="stretch")
 
-    with st.expander("How to read the frustration index", expanded=False):
+    with st.expander("How to read the components", expanded=False):
         st.markdown(
-            "- The **frustration index** is currently a weighted average of 4 components (0-100 each).\n"
-            "- **Higher is worse** across all components.\n"
-            "- Components: backlog pressure, aging open cases (>14 days), repeat requests, and resolution lag.\n"
-            "- Use **Policy Tuning Lab** to test how different priorities reshape neighborhood rankings."
+            "- **Request volume** highlights where demand is highest for the selected window.\n"
+            "- Components (backlog, aging, repeat, resolution) describe *why* pressure is elevated.\n"
+            "- Use the focused tab to see how component shifts relate to recent demand swings."
         )
 
-    baseline_rank = (
-        current_slice.sort_values("frustration_index", ascending=False)[["grain_value", "frustration_index"]]
-        .reset_index(drop=True)
-        .reset_index()
-        .rename(columns={"index": "baseline_rank"})
-    )
-    baseline_rank["baseline_rank"] = baseline_rank["baseline_rank"] + 1
-    simulated_rank = (
-        current_slice.sort_values(ranking_column, ascending=False)[["grain_value", ranking_column]]
-        .reset_index(drop=True)
-        .reset_index()
-        .rename(columns={"index": "simulated_rank"})
-    )
-    simulated_rank["simulated_rank"] = simulated_rank["simulated_rank"] + 1
-    rank_delta = baseline_rank.merge(simulated_rank, on="grain_value", how="inner")
-    rank_delta["rank_shift"] = rank_delta["baseline_rank"] - rank_delta["simulated_rank"]
-
-    st.subheader("Policy tuning impact")
-    movers = rank_delta.reindex(rank_delta["rank_shift"].abs().sort_values(ascending=False).index).head(10)
-    movers = movers.rename(
-        columns={
-            "grain_value": GRAIN_LABELS[grain],
-            "baseline_rank": "Baseline Rank (v1)",
-            "simulated_rank": "Simulated Rank",
-            "rank_shift": "Rank Shift (+ rises)",
-        }
-    )
-    st.dataframe(movers, width="stretch", hide_index=True)
-
     st.subheader("Where to intervene first")
-    hotspot_slice = hotspots[hotspots["window_days"] == window].copy()
+    hotspot_slice = hotspots[hotspots["window_days"] == component_window].copy()
     hotspot_slice["grain_value"] = hotspot_slice[grain].fillna("Unknown")
     hotspot_slice = hotspot_slice[hotspot_slice["grain_value"] != "Unknown"]
     intervention_table = build_intervention_priority_table(
@@ -1110,7 +1146,7 @@ with global_tab:
         boundary_join_key = detect_join_key(geojson, set(current_slice["grain_value"].astype(str)), grain)
 
     if geojson is not None and boundary_join_key is not None:
-        choropleth_data = current_slice[["grain_value", ranking_column]].copy()
+        choropleth_data = current_slice[["grain_value", "request_count"]].copy()
         if "grain_geo_value" in current_slice.columns:
             choropleth_data["grain_geo_value"] = current_slice["grain_geo_value"].values
         location_column = "grain_value"
@@ -1140,14 +1176,14 @@ with global_tab:
             geojson=geojson,
             locations=location_column,
             featureidkey=f"properties.{boundary_join_key}",
-            color=ranking_column,
+            color="request_count",
             color_continuous_scale="Reds",
             map_style="carto-positron",
             zoom=9.5,
             center={"lat": 32.7157, "lon": -117.1611},
             opacity=0.7,
-            labels={ranking_column: "Frustration Index"},
-            title=f"Choropleth by {GRAIN_LABELS[grain]} (latest {window}-day simulated index)",
+            labels={"request_count": "Requests"},
+            title=f"Choropleth by {GRAIN_LABELS[grain]} (latest {window}-day requests)",
         )
         fig_choropleth.update_layout(margin={"r": 0, "t": 50, "l": 0, "b": 0})
         st.plotly_chart(fig_choropleth, width="stretch")
